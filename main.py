@@ -26,7 +26,7 @@ def _gemini_configured() -> bool:
 if api_key:
     genai.configure(api_key=api_key)
 
-MODEL_NAME = "gemini-3-flash-preview"
+MODEL_NAME = "gemini-2.5-flash"
 
 # Initialize FastAPI app
 app = FastAPI()
