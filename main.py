@@ -1,27 +1,51 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from typing import Optional
+from starlette.requests import Request
+from uuid import uuid4
 import google.generativeai as genai
 import os
 import database as db
+
+
+def _db_configured() -> bool:
+    return bool(os.getenv("DATABASE_URL"))
 
 # Load .env file
 load_dotenv()
 
 # Validate GEMINI key
 api_key = os.getenv("GEMINI_API_KEY")
-if not api_key:
-    raise ValueError("GEMINI_API_KEY missing in .env")
 
-genai.configure(api_key=api_key)
+def _gemini_configured() -> bool:
+    return bool(api_key)
+
+if api_key:
+    genai.configure(api_key=api_key)
 
 MODEL_NAME = "gemini-3-flash-preview"
 
 # Initialize FastAPI app
 app = FastAPI()
+
+
+@app.on_event("startup")
+def _startup_init_db():
+    # Ensure DB tables exist (safe to run multiple times)
+    try:
+        db.init_db()
+    except Exception as e:
+        # Don't crash the server on startup; chat endpoints will surface error
+        print(f"DB init failed: {e}")
+
+
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(request: Request, exc: Exception):
+    # Ensure errors still return a response body and go through middleware
+    return JSONResponse(status_code=500, content={"error": "Internal Server Error"})
 
 # Allow frontend access
 app.add_middleware(
