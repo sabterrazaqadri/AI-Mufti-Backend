@@ -243,7 +243,21 @@ async def chat(request: Message, chat_id: str = None):
     user_input = request.content
     user_id = request.user_id
 
+    if not _gemini_configured():
+        raise HTTPException(status_code=500, detail="Server missing GEMINI_API_KEY")
+
     actual_chat_id = chat_id or request.chat_id
+
+    # If DB isn't configured, fall back to stateless chat (no persistence)
+    if not _db_configured():
+        if not actual_chat_id:
+            actual_chat_id = str(uuid4())
+        response_stream = _stateless_stream_response(user_input)
+        return StreamingResponse(
+            response_stream,
+            media_type="text/plain",
+            headers={"X-Chat-Id": actual_chat_id},
+        )
 
     if not actual_chat_id:
         title = await generate_title_with_ai(user_input)
@@ -257,6 +271,27 @@ async def chat(request: Message, chat_id: str = None):
         media_type="text/plain",
         headers={"X-Chat-Id": actual_chat_id},
     )
+
+
+def _stateless_stream_response(user_input: str):
+    generation_config = genai.types.GenerationConfig(temperature=0.1)
+    model = genai.GenerativeModel(MODEL_NAME, generation_config=generation_config)
+
+    messages_for_ai = [
+        {"role": "user", "parts": [SYSTEM_PROMPT + "\n\nUser question: " + user_input]}
+    ]
+
+    try:
+        response = model.generate_content(messages_for_ai, stream=True)
+        for chunk in response:
+            if chunk.text:
+                yield chunk.text
+    except Exception as e:
+        yield f"Error: {str(e)}"
+        return
+
+    return
+
 
 
 @app.post("/chat/{chat_id}")
