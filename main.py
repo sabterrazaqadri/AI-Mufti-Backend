@@ -31,9 +31,10 @@ MODEL_NAME = "gemini-2.5-flash"
 # Initialize FastAPI app
 app = FastAPI()
 
-@app.on_event("startup")
-async def startup_event():
-    print("GEMINI KEY LENGTH:", len(os.getenv("GEMINI_API_KEY", "")))
+@app.get("/debug-key")
+def debug_key():
+    key_length = len(os.getenv("GEMINI_API_KEY", ""))
+    return {"gemini_key_length": key_length}
 
 
 @app.on_event("startup")
