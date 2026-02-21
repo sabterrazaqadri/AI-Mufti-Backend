@@ -14,14 +14,17 @@ import database as db
 def _db_configured() -> bool:
     return bool(os.getenv("DATABASE_URL"))
 
+
 # Load .env file
 load_dotenv()
 
 # Validate GEMINI key
 api_key = os.getenv("GEMINI_API_KEY")
 
+
 def _gemini_configured() -> bool:
     return bool(api_key)
+
 
 if api_key:
     genai.configure(api_key=api_key)
@@ -31,6 +34,7 @@ MODEL_NAME = "gemini-2.5-flash"
 # Initialize FastAPI app
 app = FastAPI()
 
+
 @app.get("/debug-key")
 def debug_key():
     key_length = len(os.getenv("GEMINI_API_KEY", ""))
@@ -39,20 +43,17 @@ def debug_key():
 
 @app.on_event("startup")
 def _startup_init_db():
-    # Ensure DB tables exist (safe to run multiple times)
     try:
         db.init_db()
     except Exception as e:
-        # Don't crash the server on startup; chat endpoints will surface error
         print(f"DB init failed: {e}")
 
 
 @app.exception_handler(Exception)
 async def _unhandled_exception_handler(request: Request, exc: Exception):
-    # Ensure errors still return a response body and go through middleware
     return JSONResponse(status_code=500, content={"error": "Internal Server Error"})
 
-# Allow frontend access
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -65,7 +66,8 @@ app.add_middleware(
     expose_headers=["X-Chat-Id"],
 )
 
-# System prompt for the AI
+
+# ================= SYSTEM PROMPT =================
 SYSTEM_PROMPT = """You are a qualified Islamic scholar from the Sunni Hanafi Ahl-e-Sunnat wa Jama'at school of thought.
 Provide answers strictly based on Hanafi Fiqh, referencing authentic and classical Sunni sources
 such as Fatawa Razvia, Bahar-e-Shariat, Hidayah, and similar works.
@@ -102,18 +104,17 @@ If user asks about your capabilities, say:
 "I can answer questions related to Islamic jurisprudence (Fiqh), provide references from authentic Hanafi sources, and offer guidance on Islamic practices based on the Sunni Hanafi school of thought. I can also help with general Islamic knowledge and provide explanations on various topics within Islam, always adhering to the principles of the Hanafi Fiqh."
 If user don't ask about your capabilities, dont mention it in responces
 dont mention that you are giving answers according to sunni/hanafi fiqh, just give answers according to it without mentioning the school of thought, but if user ask about it, then mention it in answer
-if user say salam or any greeting, reply with "وعلیکم السلام / Wa Alaikum Assalam" and then answer the question, but if user dont say any greeting, just answer the question without replying to greeting
+if user say salam or any greeting, reply with "وعلیکم السلام / Wa Alaikum Assalam" and then answer the question
 """
 
 
-# Message schema
+# ================= MESSAGE SCHEMAS =================
 class Message(BaseModel):
     user_id: str
     content: str
     chat_id: Optional[str] = None
 
 
-# Chat schemas
 class CreateChatRequest(BaseModel):
     user_id: str
     title: Optional[str] = None
@@ -124,6 +125,7 @@ class UpdateTitleRequest(BaseModel):
     title: str
 
 
+# ================= ROUTES =================
 @app.get("/")
 async def root():
     return {"status": "ok", "message": "AI Mufti Backend is running"}
@@ -138,9 +140,7 @@ async def health():
     }
 
 
-# ============ CHAT HISTORY API ENDPOINTS ============
-
-
+# ================= CHAT HISTORY ENDPOINTS =================
 @app.get("/api/chats")
 async def get_chats(user_id: str):
     chats = db.ChatRepository.get_chats(user_id)
@@ -184,27 +184,21 @@ async def get_messages(chat_id: str, user_id: str):
     return {"messages": messages}
 
 
-# ============ CHAT API WITH STREAMING ============
-
-
+# ================= CHAT STREAMING =================
 async def generate_title_with_ai(user_input: str) -> str:
     try:
         generation_config = genai.types.GenerationConfig(temperature=0.7)
         model = genai.GenerativeModel(MODEL_NAME, generation_config=generation_config)
-
         prompt = (
             "Generate a very short, 4-6 word maximum, topic-based title for an Islamic chat session "
             f"starting with this message: '{user_input}'. "
             "The title should be in the same language as the message (Urdu, Roman Urdu, or English). "
             "Do not use quotes or special characters."
         )
-
         response = model.generate_content(prompt)
         title = response.text.strip()
-
         if not title or len(title.split()) > 10:
             return db.generate_title_from_message(user_input)
-
         return title
     except Exception as e:
         print(f"AI Title generation failed: {e}")
@@ -215,24 +209,23 @@ def generate_stream_response(user_id: str, user_input: str, chat_id: str = None)
     generation_config = genai.types.GenerationConfig(temperature=0.1)
     model = genai.GenerativeModel(MODEL_NAME, generation_config=generation_config)
 
-    messages_for_ai = []
+    # Always start messages with system prompt
+    messages_for_ai = [{"role": "system", "content": SYSTEM_PROMPT}]
 
+    # Include previous chat messages if available
     if chat_id:
         previous_messages = db.MessageRepository.get_messages(chat_id, user_id)
         for msg in previous_messages:
-            role = "user" if msg["role"] == "user" else "model"
-            messages_for_ai.append({"role": role, "parts": [msg["content"]]})
+            role = "user" if msg["role"] == "user" else "assistant"
+            messages_for_ai.append({"role": role, "content": msg["content"]})
 
-    if not messages_for_ai:
-        messages_for_ai.append(
-            {"role": "user", "parts": [SYSTEM_PROMPT + "\n\nUser question: " + user_input]}
-        )
-    else:
-        messages_for_ai.append({"role": "user", "parts": [user_input]})
+    # Append current user input
+    messages_for_ai.append({"role": "user", "content": user_input})
 
     try:
         response = model.generate_content(messages_for_ai, stream=True)
 
+        # Save user input in DB
         db.MessageRepository.create_message(chat_id, "user", user_input)
 
         full_response = ""
@@ -248,6 +241,25 @@ def generate_stream_response(user_id: str, user_input: str, chat_id: str = None)
         yield f"Error: {str(e)}"
 
 
+def _stateless_stream_response(user_input: str):
+    generation_config = genai.types.GenerationConfig(temperature=0.1)
+    model = genai.GenerativeModel(MODEL_NAME, generation_config=generation_config)
+
+    messages_for_ai = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_input}
+    ]
+
+    try:
+        response = model.generate_content(messages_for_ai, stream=True)
+        for chunk in response:
+            if chunk.text:
+                yield chunk.text
+    except Exception as e:
+        yield f"Error: {str(e)}"
+        return
+
+
 @app.post("/chat")
 async def chat(request: Message, chat_id: str = None):
     user_input = request.content
@@ -258,7 +270,6 @@ async def chat(request: Message, chat_id: str = None):
 
     actual_chat_id = chat_id or request.chat_id
 
-    # If DB isn't configured, fall back to stateless chat (no persistence)
     if not _db_configured():
         if not actual_chat_id:
             actual_chat_id = str(uuid4())
@@ -281,27 +292,6 @@ async def chat(request: Message, chat_id: str = None):
         media_type="text/plain",
         headers={"X-Chat-Id": actual_chat_id},
     )
-
-
-def _stateless_stream_response(user_input: str):
-    generation_config = genai.types.GenerationConfig(temperature=0.1)
-    model = genai.GenerativeModel(MODEL_NAME, generation_config=generation_config)
-
-    messages_for_ai = [
-        {"role": "user", "parts": [SYSTEM_PROMPT + "\n\nUser question: " + user_input]}
-    ]
-
-    try:
-        response = model.generate_content(messages_for_ai, stream=True)
-        for chunk in response:
-            if chunk.text:
-                yield chunk.text
-    except Exception as e:
-        yield f"Error: {str(e)}"
-        return
-
-    return
-
 
 
 @app.post("/chat/{chat_id}")
