@@ -11,6 +11,7 @@ import os
 import database as db
 
 
+# ================= CONFIGURATION =================
 def _db_configured() -> bool:
     return bool(os.getenv("DATABASE_URL"))
 
@@ -18,7 +19,7 @@ def _db_configured() -> bool:
 # Load .env file
 load_dotenv()
 
-# Validate GEMINI key
+# GEMINI API key
 api_key = os.getenv("GEMINI_API_KEY")
 
 
@@ -31,7 +32,8 @@ if api_key:
 
 MODEL_NAME = "gemini-2.5-flash"
 
-# Initialize FastAPI app
+
+# ================= INITIALIZE FASTAPI =================
 app = FastAPI()
 
 
@@ -54,6 +56,7 @@ async def _unhandled_exception_handler(request: Request, exc: Exception):
     return JSONResponse(status_code=500, content={"error": "Internal Server Error"})
 
 
+# Allow frontend access
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -102,7 +105,7 @@ If user asks about your creator/developer, say:
 If User Dont ask about your name or your creator name , dont mention it in responces
 If user asks about your capabilities, say:
 "I can answer questions related to Islamic jurisprudence (Fiqh), provide references from authentic Hanafi sources, and offer guidance on Islamic practices based on the Sunni Hanafi school of thought. I can also help with general Islamic knowledge and provide explanations on various topics within Islam, always adhering to the principles of the Hanafi Fiqh."
-If user don't ask about your capabilities, dont mention it in responces
+if user don't ask about your capabilities, dont mention it in responces
 dont mention that you are giving answers according to sunni/hanafi fiqh, just give answers according to it without mentioning the school of thought, but if user ask about it, then mention it in answer
 if user say salam or any greeting, reply with "وعلیکم السلام / Wa Alaikum Assalam" and then answer the question
 """
@@ -207,12 +210,14 @@ async def generate_title_with_ai(user_input: str) -> str:
 
 def generate_stream_response(user_id: str, user_input: str, chat_id: str = None):
     generation_config = genai.types.GenerationConfig(temperature=0.1)
+
+    # ==== NEW: instantiate model per request ====
     model = genai.GenerativeModel(MODEL_NAME, generation_config=generation_config)
 
-    # Always start messages with system prompt
+    # Always start with system prompt
     messages_for_ai = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-    # Include previous chat messages if available
+    # Append previous chat messages
     if chat_id:
         previous_messages = db.MessageRepository.get_messages(chat_id, user_id)
         for msg in previous_messages:
@@ -225,7 +230,6 @@ def generate_stream_response(user_id: str, user_input: str, chat_id: str = None)
     try:
         response = model.generate_content(messages_for_ai, stream=True)
 
-        # Save user input in DB
         db.MessageRepository.create_message(chat_id, "user", user_input)
 
         full_response = ""
