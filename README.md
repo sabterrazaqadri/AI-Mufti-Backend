@@ -5,6 +5,7 @@ colorFrom: blue
 colorTo: purple
 sdk: docker
 pinned: false
+license: mit
 ---
 
 # AI Mufti Backend
@@ -50,7 +51,3 @@ This space runs using Docker. Build and run:
 docker build -t ai-mufti-backend .
 docker run -p 8000:8000 -e GEMINI_API_KEY=your_key ai-mufti-backend
 ```
-
-## License
-
-MIT
