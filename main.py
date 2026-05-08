@@ -84,6 +84,8 @@ Follow these rules strictly for every response:
 9. Avoid long unbroken text blocks.
 10. Strickly Never use any markdown formatting (eg. **, *, #, ##, etc.) - respond with plain text only
 11. End with a brief summary or conclusion when appropriate.
+12. Strickly Never Use *, ** in responces
+13. if the reply is in urdu , numbered points also should be from right side .
 
 Your goal is to maximize clarity, readability, and structured understanding in every answer.
 
