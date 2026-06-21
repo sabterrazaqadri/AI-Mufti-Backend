@@ -1,137 +1,169 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse
-from pydantic import BaseModel
-from dotenv import load_dotenv
-from typing import Optional
-from starlette.requests import Request
-from uuid import uuid4
-import google.generativeai as genai
+import base64
+import json
 import os
-import database as db
+import threading
+from contextlib import asynccontextmanager
+from typing import Optional
+from uuid import uuid4
 
+import google.generativeai as genai
+from dotenv import load_dotenv
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
+
+import database as db
+import rag
+from auth import auth_configured, get_current_user_id, get_optional_user_id
 
 # ================= CONFIGURATION =================
-def _db_configured() -> bool:
-    return bool(os.getenv("DATABASE_URL"))
-
-
-# Load .env file
 load_dotenv()
 
-# GEMINI API key
-api_key = os.getenv("GEMINI_API_KEY")
+api_key = (os.getenv("GEMINI_API_KEY") or "").strip() or None
+MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "30"))
+
+if api_key:
+    genai.configure(api_key=api_key)
+
+
+def _db_configured() -> bool:
+    return bool(os.getenv("DATABASE_URL"))
 
 
 def _gemini_configured() -> bool:
     return bool(api_key)
 
 
-if api_key:
-    genai.configure(api_key=api_key)
+# ================= SYSTEM PROMPT =================
+SYSTEM_PROMPT = """You are "AI MUFTI", a knowledgeable and respectful Islamic assistant.
 
-MODEL_NAME = "gemini-2.5-flash"
+MASLAK / SCHOOL (STRICT):
+You answer strictly according to Ahl-e-Sunnat wa Jama'at, the Hanafi school of Fiqh
+in the Barelvi (Razvi) tradition. Your rulings follow the positions of Imam-e-Azam Abu
+Hanifa and the verified positions of A'la Hazrat Imam Ahmad Raza Khan Barelvi.
+
+AUTHENTIC SOURCES you may rely on and cite:
+- Qur'an al-Kareem and authentic Hadith (Sahih Bukhari, Muslim, Sunan, etc.)
+- Fatawa Razvia, Bahar-e-Shariat (Sadr al-Shariah), Fatawa Amjadia, Fatawa Faqih-e-Millat
+- Hidayah, Durr-e-Mukhtar, Radd al-Muhtar (Fatawa Shami), Fatawa Alamgiri (Fatawa Hindiyya)
+- Kanz al-Daqaiq, Nur al-Idah, Maraqi al-Falah and similar classical Hanafi works
+
+ACCURACY RULES (most important — never violate):
+1. NEVER invent, fabricate, or guess a Qur'an verse, Hadith, book name, volume, or page
+   number. If you are not certain of an exact reference, state the ruling generally and say
+   the precise reference should be confirmed from a reliable source.
+2. If a question is genuinely disputed (ikhtilaf) among reliable Hanafi/Barelvi scholars,
+   say so honestly and give the relied-upon (mufta bihi) position.
+3. If you do not know, say clearly: "Is mas'ale ka yaqeeni jawab dene ke liye kisi mustanad
+   Sunni Hanafi mufti ya Dar al-Ifta se rujuʿ farmaiye." Do not bluff.
+4. For matters of personal worship, divorce (talaq), inheritance (mirath), and other serious
+   rulings, add a brief note advising the user to confirm with a qualified local mufti, because
+   the ruling can depend on exact circumstances.
+5. Do not issue rulings that contradict the Ahl-e-Sunnat Barelvi position.
+
+SCOPE:
+- Answer only Islamic questions (aqaid, fiqh, ibadat, akhlaq, seerah, Islamic guidance).
+- For non-Islamic questions reply exactly:
+  "معذرت، میں صرف اسلامی مسائل پر علم رکھتا ہوں۔ / Sorry, I only have knowledge about Islamic matters."
+
+FORMAT (plain text only — NO Markdown, no #, *, **, or backticks):
+1. Start with a short, clear introductory sentence.
+2. Break content into logical points using "1.", "2.", "3." and sub-points using "•".
+3. Keep paragraphs short and focused.
+4. When you cite, name the source plainly, e.g. "(Bahar-e-Shariat, Hissa 3)".
+5. End with a one-line conclusion or, where relevant, the advice to confirm with a mufti.
+6. When replying in Urdu, write numbered points right-to-left (Urdu numbering on the
+   right side) so the list reads naturally in Urdu.
+
+LANGUAGE:
+- Reply in the SAME language/script the user used (Urdu, Roman Urdu, English, or Arabic).
+- If the user sends Salam, begin with "وعلیکم السلام / Wa Alaikum Assalam" then answer.
+
+IDENTITY (only if asked):
+- Name: "AI MUFTI".
+- Creator/developer: "I am created by world-renowned Naat reciter Sabter Raza Qadri
+  (سبطر رضا قادری اختری)."
+- Capabilities: you answer questions on Islamic jurisprudence (Hanafi Fiqh), provide
+  references from authentic Ahl-e-Sunnat sources, and give guidance on Islamic practice.
+- Do NOT volunteer your name, creator, maslak label, or capabilities unless explicitly asked.
+"""
+
+TITLE_PROMPT = (
+    "Generate a very short topic title (4-6 words maximum) for an Islamic chat that starts "
+    "with this message. Use the same language/script as the message. Reply with ONLY the "
+    "title, no quotes, no punctuation at the end.\n\nMessage: "
+)
+
+# ================= APP SETUP =================
+limiter = Limiter(key_func=get_remote_address)
 
 
-# ================= INITIALIZE FASTAPI =================
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if _db_configured():
+        try:
+            db.init_db()
+        except Exception as exc:  # pragma: no cover
+            print(f"DB init failed: {exc}")
+        if _gemini_configured():
+            try:
+                rag.init_rag()
+            except Exception as exc:  # pragma: no cover
+                print(f"RAG init failed: {exc}")
+    yield
 
 
-@app.get("/debug-key")
-def debug_key():
-    key_length = len(os.getenv("GEMINI_API_KEY", ""))
-    return {"gemini_key_length": key_length}
-
-
-@app.on_event("startup")
-def _startup_init_db():
-    try:
-        db.init_db()
-    except Exception as e:
-        print(f"DB init failed: {e}")
+app = FastAPI(title="AI Mufti Backend", lifespan=lifespan)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 
 @app.exception_handler(Exception)
 async def _unhandled_exception_handler(request: Request, exc: Exception):
+    print(f"Unhandled error: {exc}")
     return JSONResponse(status_code=500, content={"error": "Internal Server Error"})
 
 
-# Allow frontend access
+_default_origins = "https://digitalmufti.vercel.app,http://localhost:3000"
+_origins = [o.strip() for o in os.getenv("CORS_ORIGINS", _default_origins).split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://digitalmufti.vercel.app",
-        "http://localhost:3000",
-    ],
+    allow_origins=_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["X-Chat-Id"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
+    expose_headers=["X-Chat-Id", "X-Sources"],
 )
 
 
-# ================= SYSTEM PROMPT =================
-SYSTEM_PROMPT = """Respond in plain text only. Do not use any Markdown formatting, headers (###), bold, italics, or asterisks.
-Use numbered points, bullet points as plain text (•), and line breaks for structure.
-
-You are a qualified Islamic scholar from the Sunni Hanafi Ahl-e-Sunnat wa Jama'at school of thought.
-Provide answers strictly based on Hanafi Fiqh, referencing authentic and classical Sunni sources
-such as Fatawa Razvia, Bahar-e-Shariat, Hidayah, and similar works.
-
-Always give Qur'an, Hadith, or authentic Hanafi references.
-
-Do not answer non-Islamic questions. Reply:
-"معذرت، میں صرف اسلامی مسائل پر علم رکھتا ہوں۔ / Sorry, I only have knowledge about Islamic matters."
-
-Always respond in a clear, structured, and well-organized format.
-
-Follow these rules strictly for every response:
-1. Start with a short, clear introductory paragraph.
-2. Break the main content into logical sections.
-3. Use numbered points (1, 2, 3…) for explanations.
-4. Use bullet points (•) for sub-points.
-5. Keep paragraphs concise and focused on one idea.
-6. Maintain a logical flow from basic to advanced concepts.
-7. Use simple, formal, and explanatory language.
-8. Highlight key terms where helpful.
-9. Avoid long unbroken text blocks.
-10. Never use any Markdown formatting (no **, *, #, ##, etc.) - respond with plain text only.
-11. End with a brief summary or conclusion when appropriate.
-
-Your goal is to maximize clarity, readability, and structured understanding in every answer.
-
-Reply in the same language as the user is using (e.g., Roman Urdu, Urdu, English).
-
-If the user asks about your name, say: "AI MUFTI".
-If the user asks about your creator/developer, say:
-"I am created by World Famous Naat Recitor Sabter Raza Qadri (سبطر رضا قادری اختری)".
-If the user does not ask about your name or creator, do not mention it in responses.
-If the user asks about your capabilities, say:
-"I can answer questions related to Islamic jurisprudence (Fiqh), provide references from authentic Hanafi sources, and offer guidance on Islamic practices based on the Sunni Hanafi school of thought. I can also help with general Islamic knowledge and provide explanations on various topics within Islam, always adhering to the principles of the Hanafi Fiqh."
-If the user does not ask about your capabilities, do not mention it in responses.
-Do not mention that you are giving answers according to Sunni/Hanafi Fiqh; just answer according to it without explicitly stating it, unless asked.
-If the user says salam or any greeting, reply with "وعلیکم السلام / Wa Alaikum Assalam" and then answer the question.
-"""
+def _encode_sources(passages) -> str:
+    """Base64(JSON) so retrieved citations can ride along in a response header."""
+    payload = json.dumps(rag.public_passages(passages), ensure_ascii=False)
+    return base64.b64encode(payload.encode("utf-8")).decode("ascii")
 
 
-# ================= MESSAGE SCHEMAS =================
+# ================= SCHEMAS =================
 class Message(BaseModel):
-    user_id: str
-    content: str
+    content: str = Field(..., min_length=1, max_length=4000)
     chat_id: Optional[str] = None
 
 
 class CreateChatRequest(BaseModel):
-    user_id: str
-    title: Optional[str] = None
+    title: Optional[str] = Field(default="New Chat", max_length=500)
 
 
 class UpdateTitleRequest(BaseModel):
-    user_id: str
-    title: str
+    title: str = Field(..., min_length=1, max_length=500)
 
 
-# ================= ROUTES =================
+# ================= HEALTH =================
 @app.get("/")
 async def root():
     return {"status": "ok", "message": "AI Mufti Backend is running"}
@@ -141,166 +173,173 @@ async def root():
 async def health():
     return {
         "status": "healthy",
-        "api_key_configured": bool(api_key),
+        "api_key_configured": _gemini_configured(),
+        "auth_configured": auth_configured(),
+        "db_configured": _db_configured(),
         "model": MODEL_NAME,
     }
 
 
-# ================= CHAT HISTORY ENDPOINTS =================
+# ================= CHAT HISTORY (auth required) =================
 @app.get("/api/chats")
-async def get_chats(user_id: str):
-    chats = db.ChatRepository.get_chats(user_id)
+async def get_chats(user_id: str = Depends(get_current_user_id)):
+    chats = await run_in_threadpool(db.ChatRepository.get_chats, user_id)
     return {"chats": chats}
 
 
 @app.get("/api/chats/{chat_id}")
-async def get_chat(chat_id: str, user_id: str):
-    chat = db.ChatRepository.get_chat(chat_id, user_id)
+async def get_chat(chat_id: str, user_id: str = Depends(get_current_user_id)):
+    chat = await run_in_threadpool(db.ChatRepository.get_chat, chat_id, user_id)
     if not chat:
         raise HTTPException(status_code=404, detail="Chat not found")
     return chat
 
 
 @app.post("/api/chats")
-async def create_chat(request: CreateChatRequest):
+async def create_chat(request: CreateChatRequest, user_id: str = Depends(get_current_user_id)):
     title = request.title or "New Chat"
-    chat = db.ChatRepository.create_chat(request.user_id, title)
-    return chat
+    return await run_in_threadpool(db.ChatRepository.create_chat, user_id, title)
 
 
 @app.put("/api/chats/{chat_id}/title")
-async def update_chat_title(chat_id: str, request: UpdateTitleRequest):
-    chat = db.ChatRepository.update_chat_title(chat_id, request.user_id, request.title)
+async def update_chat_title(
+    chat_id: str, request: UpdateTitleRequest, user_id: str = Depends(get_current_user_id)
+):
+    chat = await run_in_threadpool(
+        db.ChatRepository.update_chat_title, chat_id, user_id, request.title
+    )
     if not chat:
         raise HTTPException(status_code=404, detail="Chat not found")
     return chat
 
 
 @app.delete("/api/chats/{chat_id}")
-async def delete_chat(chat_id: str, user_id: str):
-    success = db.ChatRepository.delete_chat(chat_id, user_id)
+async def delete_chat(chat_id: str, user_id: str = Depends(get_current_user_id)):
+    success = await run_in_threadpool(db.ChatRepository.delete_chat, chat_id, user_id)
     if not success:
         raise HTTPException(status_code=404, detail="Chat not found")
     return {"success": True}
 
 
 @app.get("/api/chats/{chat_id}/messages")
-async def get_messages(chat_id: str, user_id: str):
-    messages = db.MessageRepository.get_messages(chat_id, user_id)
+async def get_messages(chat_id: str, user_id: str = Depends(get_current_user_id)):
+    messages = await run_in_threadpool(db.MessageRepository.get_messages, chat_id, user_id)
     return {"messages": messages}
 
 
-# ================= CHAT STREAMING =================
-async def generate_title_with_ai(user_input: str) -> str:
-    try:
-        generation_config = genai.types.GenerationConfig(temperature=0.7)
-        model = genai.GenerativeModel(MODEL_NAME, generation_config=generation_config)
-        prompt = (
-            "Generate a very short, 4-6 word maximum, topic-based title for an Islamic chat session "
-            f"starting with this message: '{user_input}'. "
-            "The title should be in the same language as the message (Urdu, Roman Urdu, or English). "
-            "Do not use quotes or special characters."
-        )
-        response = model.generate_content(prompt)
-        title = response.text.strip()
-        if not title or len(title.split()) > 10:
-            return db.generate_title_from_message(user_input)
-        return title
-    except Exception as e:
-        print(f"AI Title generation failed: {e}")
-        return db.generate_title_from_message(user_input)
-
-
-def generate_stream_response(user_id: str, user_input: str, chat_id: str = None):
-    generation_config = genai.types.GenerationConfig(temperature=0.1)
-
-    # ==== NEW: instantiate model per request ====
-    model = genai.GenerativeModel(MODEL_NAME, generation_config=generation_config)
-
-    # Always start with system prompt
-    messages_for_ai = [{"role": "system", "content": SYSTEM_PROMPT}]
-
-    # Append previous chat messages
-    if chat_id:
-        previous_messages = db.MessageRepository.get_messages(chat_id, user_id)
-        for msg in previous_messages:
-            role = "user" if msg["role"] == "user" else "assistant"
-            messages_for_ai.append({"role": role, "content": msg["content"]})
-
-    # Append current user input
-    messages_for_ai.append({"role": "user", "content": user_input})
-
-    try:
-        response = model.generate_content(messages_for_ai, stream=True)
-
-        db.MessageRepository.create_message(chat_id, "user", user_input)
-
-        full_response = ""
-        for chunk in response:
-            if chunk.text:
-                full_response += chunk.text
-                yield chunk.text
-
-        if full_response:
-            db.MessageRepository.create_message(chat_id, "assistant", full_response)
-
-    except Exception as e:
-        yield f"Error: {str(e)}"
-
-
-def _stateless_stream_response(user_input: str):
-    generation_config = genai.types.GenerationConfig(temperature=0.1)
-    model = genai.GenerativeModel(MODEL_NAME, generation_config=generation_config)
-
-    messages_for_ai = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_input}
-    ]
-
-    try:
-        response = model.generate_content(messages_for_ai, stream=True)
-        for chunk in response:
-            if chunk.text:
-                yield chunk.text
-    except Exception as e:
-        yield f"Error: {str(e)}"
-        return
-
-
-@app.post("/chat")
-async def chat(request: Message, chat_id: str = None):
-    user_input = request.content
-    user_id = request.user_id
-
-    if not _gemini_configured():
-        raise HTTPException(status_code=500, detail="Server missing GEMINI_API_KEY")
-
-    actual_chat_id = chat_id or request.chat_id
-
-    if not _db_configured():
-        if not actual_chat_id:
-            actual_chat_id = str(uuid4())
-        response_stream = _stateless_stream_response(user_input)
-        return StreamingResponse(
-            response_stream,
-            media_type="text/plain",
-            headers={"X-Chat-Id": actual_chat_id},
-        )
-
-    if not actual_chat_id:
-        title = await generate_title_with_ai(user_input)
-        chat_obj = db.ChatRepository.create_chat(user_id, title)
-        actual_chat_id = str(chat_obj["id"])
-
-    response_stream = generate_stream_response(user_id, user_input, actual_chat_id)
-
-    return StreamingResponse(
-        response_stream,
-        media_type="text/plain",
-        headers={"X-Chat-Id": actual_chat_id},
+# ================= GEMINI HELPERS =================
+def _build_model() -> "genai.GenerativeModel":
+    """Model with the system prompt as a real system_instruction and low temperature."""
+    return genai.GenerativeModel(
+        MODEL_NAME,
+        system_instruction=SYSTEM_PROMPT,
+        generation_config=genai.types.GenerationConfig(temperature=0.15, top_p=0.9),
     )
 
 
-@app.post("/chat/{chat_id}")
-async def chat_with_history(chat_id: str, request: Message):
-    return await chat(request, chat_id)
+def _to_gemini_contents(history, user_input: str):
+    """Map stored messages to Gemini's content format (roles: user / model, parts: [...])."""
+    contents = []
+    for msg in history[-MAX_HISTORY_MESSAGES:]:
+        role = "model" if msg["role"] == "assistant" else "user"
+        contents.append({"role": role, "parts": [msg["content"]]})
+    contents.append({"role": "user", "parts": [user_input]})
+    return contents
+
+
+def _refine_title_in_background(chat_id: str, user_id: str, user_input: str):
+    try:
+        model = genai.GenerativeModel(
+            MODEL_NAME, generation_config=genai.types.GenerationConfig(temperature=0.4)
+        )
+        resp = model.generate_content(TITLE_PROMPT + user_input)
+        title = (resp.text or "").strip().strip('"').strip()
+        if title and len(title.split()) <= 10:
+            db.ChatRepository.update_chat_title(chat_id, user_id, title)
+    except Exception as exc:  # pragma: no cover
+        print(f"Title refinement failed: {exc}")
+
+
+def _stream_response(user_text: str, grounded_text: str, history, persist=None):
+    """Stream chunks. `user_text` is persisted; `grounded_text` (with retrieved
+    citations) is what the model actually sees. `persist` = (chat_id, user_id)."""
+    model = _build_model()
+    try:
+        response = model.generate_content(_to_gemini_contents(history, grounded_text), stream=True)
+        if persist:
+            chat_id, user_id = persist
+            db.MessageRepository.create_message(chat_id, user_id, "user", user_text)
+
+        full = ""
+        for chunk in response:
+            if chunk.text:
+                full += chunk.text
+                yield chunk.text
+
+        if persist and full:
+            chat_id, user_id = persist
+            db.MessageRepository.create_message(chat_id, user_id, "assistant", full)
+    except Exception as exc:
+        yield (
+            "معذرت، اس وقت جواب تیار کرنے میں دشواری ہو رہی ہے۔ / "
+            "Sorry, I could not generate a response right now. Please try again."
+        )
+        print(f"Generation error: {exc}")
+
+
+# ================= CHAT =================
+@app.post("/chat")
+@limiter.limit("20/minute")
+async def chat(
+    request: Request,
+    body: Message,
+    user_id: Optional[str] = Depends(get_optional_user_id),
+):
+    if not _gemini_configured():
+        raise HTTPException(status_code=503, detail="Server missing GEMINI_API_KEY")
+
+    user_input = body.content.strip()
+    chat_id = body.chat_id
+
+    # RAG: retrieve supporting source passages and ground the prompt.
+    passages = await run_in_threadpool(rag.retrieve, user_input)
+    grounded_input = rag.build_grounded_input(user_input, passages)
+
+    # Guests (no token) or no DB -> stateless, nothing persisted.
+    if not user_id or not _db_configured():
+        headers = {"X-Chat-Id": chat_id or str(uuid4())}
+        if passages:
+            headers["X-Sources"] = _encode_sources(passages)
+        return StreamingResponse(
+            _stream_response(user_input, grounded_input, history=[]),
+            media_type="text/plain; charset=utf-8",
+            headers=headers,
+        )
+
+    # Signed-in user with DB: load (and verify-owned) history, persist new messages.
+    if chat_id:
+        owned = await run_in_threadpool(db.ChatRepository.get_chat, chat_id, user_id)
+        if not owned:
+            raise HTTPException(status_code=404, detail="Chat not found")
+        history = await run_in_threadpool(db.MessageRepository.get_messages, chat_id, user_id)
+    else:
+        # Instant heuristic title now; refine with AI in the background (no first-token delay).
+        chat_obj = await run_in_threadpool(
+            db.ChatRepository.create_chat, user_id, db.generate_title_from_message(user_input)
+        )
+        chat_id = str(chat_obj["id"])
+        history = []
+        threading.Thread(
+            target=_refine_title_in_background,
+            args=(chat_id, user_id, user_input),
+            daemon=True,
+        ).start()
+
+    headers = {"X-Chat-Id": chat_id}
+    if passages:
+        headers["X-Sources"] = _encode_sources(passages)
+    return StreamingResponse(
+        _stream_response(user_input, grounded_input, history, persist=(chat_id, user_id)),
+        media_type="text/plain; charset=utf-8",
+        headers=headers,
+    )
