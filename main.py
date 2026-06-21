@@ -260,31 +260,51 @@ def _refine_title_in_background(chat_id: str, user_id: str, user_input: str):
         print(f"Title refinement failed: {exc}")
 
 
+def _chunk_text(chunk) -> str:
+    """Safely read a streamed chunk's text. Gemini's final chunk often has no text
+    part (just a finish reason), and accessing `.text` then raises — so guard it."""
+    try:
+        return chunk.text or ""
+    except Exception:
+        return ""
+
+
 def _stream_response(user_text: str, grounded_text: str, history, persist=None):
     """Stream chunks. `user_text` is persisted; `grounded_text` (with retrieved
     citations) is what the model actually sees. `persist` = (chat_id, user_id)."""
     model = _build_model()
+    full = ""
+    failed = False
+
     try:
         response = model.generate_content(_to_gemini_contents(history, grounded_text), stream=True)
         if persist:
             chat_id, user_id = persist
             db.MessageRepository.create_message(chat_id, user_id, "user", user_text)
 
-        full = ""
         for chunk in response:
-            if chunk.text:
-                full += chunk.text
-                yield chunk.text
-
-        if persist and full:
-            chat_id, user_id = persist
-            db.MessageRepository.create_message(chat_id, user_id, "assistant", full)
+            text = _chunk_text(chunk)
+            if text:
+                full += text
+                yield text
     except Exception as exc:
+        failed = True
+        print(f"Generation error: {exc}")
+
+    # Only show the fallback if we produced NOTHING — never append it to a real answer.
+    if not full and failed:
         yield (
             "معذرت، اس وقت جواب تیار کرنے میں دشواری ہو رہی ہے۔ / "
             "Sorry, I could not generate a response right now. Please try again."
         )
-        print(f"Generation error: {exc}")
+
+    # Persist the assistant reply separately so a DB hiccup can't corrupt the output.
+    if persist and full:
+        try:
+            chat_id, user_id = persist
+            db.MessageRepository.create_message(chat_id, user_id, "assistant", full)
+        except Exception as exc:
+            print(f"Persist assistant message failed: {exc}")
 
 
 # ================= CHAT =================
