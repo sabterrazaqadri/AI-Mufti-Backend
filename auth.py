@@ -16,11 +16,22 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Base URL of the Next.js app that issues tokens (Better Auth `baseURL`).
+# Base URL(s) of the Next.js app that issue tokens (Better Auth `baseURL`).
+# Accepts a comma-separated list so a single backend can trust tokens from both
+# production and local dev (e.g. "https://digitalmufti.vercel.app,http://localhost:3000")
+# — both share the same DB/signing keys, only the `iss` claim differs.
 # .strip() guards against a trailing newline/space in the host's secret value —
 # otherwise the JWKS hostname becomes "...vercel.app\n" and DNS fails with
 # "Name or service not known", silently 401-ing every signed-in request.
-BETTER_AUTH_URL = (os.getenv("BETTER_AUTH_URL") or "").strip().rstrip("/")
+_AUTH_URLS = [
+    u.strip().rstrip("/")
+    for u in (os.getenv("BETTER_AUTH_URL") or "").split(",")
+    if u.strip()
+]
+# Primary URL (first entry) is used to locate the JWKS endpoint.
+BETTER_AUTH_URL = _AUTH_URLS[0] if _AUTH_URLS else ""
+# Every configured URL is an accepted token issuer.
+ALLOWED_ISSUERS = set(_AUTH_URLS)
 # JWKS published by the Better Auth `jwt` plugin.
 JWKS_URL = (os.getenv("BETTER_AUTH_JWKS_URL") or "").strip() or (
     f"{BETTER_AUTH_URL}/api/auth/jwks" if BETTER_AUTH_URL else None
@@ -46,16 +57,20 @@ def _verify_token(token: str) -> str:
             token,
             signing_key.key,
             algorithms=ALGORITHMS,
-            issuer=BETTER_AUTH_URL or None,
             options={
                 "verify_aud": False,
-                "verify_iss": bool(BETTER_AUTH_URL),
+                # Issuer is checked manually below against the allowed set, so
+                # one backend can accept tokens from prod and localhost alike.
+                "verify_iss": False,
                 "require": ["exp", "sub"],
             },
             leeway=10,
         )
     except jwt.PyJWTError as exc:
         raise HTTPException(status_code=401, detail=f"Invalid token: {exc}")
+
+    if ALLOWED_ISSUERS and claims.get("iss") not in ALLOWED_ISSUERS:
+        raise HTTPException(status_code=401, detail="Invalid token: Invalid issuer")
 
     sub = claims.get("sub")
     if not sub:
