@@ -17,9 +17,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Base URL of the Next.js app that issues tokens (Better Auth `baseURL`).
-BETTER_AUTH_URL = (os.getenv("BETTER_AUTH_URL") or "").rstrip("/")
+# .strip() guards against a trailing newline/space in the host's secret value —
+# otherwise the JWKS hostname becomes "...vercel.app\n" and DNS fails with
+# "Name or service not known", silently 401-ing every signed-in request.
+BETTER_AUTH_URL = (os.getenv("BETTER_AUTH_URL") or "").strip().rstrip("/")
 # JWKS published by the Better Auth `jwt` plugin.
-JWKS_URL = os.getenv("BETTER_AUTH_JWKS_URL") or (
+JWKS_URL = (os.getenv("BETTER_AUTH_JWKS_URL") or "").strip() or (
     f"{BETTER_AUTH_URL}/api/auth/jwks" if BETTER_AUTH_URL else None
 )
 
