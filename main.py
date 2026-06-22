@@ -275,6 +275,7 @@ def _stream_response(user_text: str, grounded_text: str, history, persist=None):
     model = _build_model()
     full = ""
     failed = False
+    err_detail = ""
 
     try:
         response = model.generate_content(_to_gemini_contents(history, grounded_text), stream=True)
@@ -289,13 +290,16 @@ def _stream_response(user_text: str, grounded_text: str, history, persist=None):
                 yield text
     except Exception as exc:
         failed = True
-        print(f"Generation error: {exc}")
+        err_detail = f"{type(exc).__name__}: {exc}"
+        print(f"Generation error: {err_detail}")
 
     # Only show the fallback if we produced NOTHING — never append it to a real answer.
     if not full and failed:
+        # Surface the error detail only when explicitly debugging.
+        suffix = f"\n\n[debug: {err_detail}]" if os.getenv("DEBUG_ERRORS") == "1" else ""
         yield (
             "معذرت، اس وقت جواب تیار کرنے میں دشواری ہو رہی ہے۔ / "
-            "Sorry, I could not generate a response right now. Please try again."
+            "Sorry, I could not generate a response right now. Please try again." + suffix
         )
 
     # Persist the assistant reply separately so a DB hiccup can't corrupt the output.
@@ -349,11 +353,14 @@ async def chat(
         )
         chat_id = str(chat_obj["id"])
         history = []
-        threading.Thread(
-            target=_refine_title_in_background,
-            args=(chat_id, user_id, user_input),
-            daemon=True,
-        ).start()
+        # AI title refinement costs a SECOND model call per new chat — off by
+        # default to conserve quota; the heuristic title above is already set.
+        if os.getenv("AI_TITLES") == "1":
+            threading.Thread(
+                target=_refine_title_in_background,
+                args=(chat_id, user_id, user_input),
+                daemon=True,
+            ).start()
 
     headers = {"X-Chat-Id": chat_id}
     if passages:
