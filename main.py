@@ -225,6 +225,40 @@ def _should_retrieve(user_input: str) -> bool:
     return len(norm.split()) >= 3
 
 
+# Common Roman-Urdu function/topic words — used to detect when a Latin-script
+# message is actually Urdu so we can force a Roman-Urdu reply (flash-lite otherwise
+# defaults to English for "formal ruling" questions).
+_ROMAN_URDU_WORDS = {
+    "ka", "ki", "ke", "ko", "se", "me", "mein", "par", "hai", "hain", "ho", "hota",
+    "hoti", "kya", "kyun", "kaise", "kaisay", "kar", "kare", "karna", "karein",
+    "kitne", "kitna", "konsa", "kaunsa", "kaun", "hukum", "hukm", "masla", "masala",
+    "masail", "batao", "bataye", "bataiye", "jaiz", "najaiz", "gunah", "sahih",
+    "ghalat", "namaz", "roza", "rozay", "wuzu", "wudu", "zakat", "talaq", "nikah",
+    "farz", "sunnat", "wajib", "makruh", "halal", "haram", "mufti", "shariat",
+    "deen", "imaan", "musafir", "sajda", "qaza", "fidya", "qurbani",
+}
+_ARABIC_RE = __import__("re").compile(r"[؀-ۿݐ-ݿﭐ-﻿]")
+
+
+def _language_directive(text: str) -> str:
+    """If the user wrote in Roman Urdu, return an explicit instruction to reply in
+    Roman Urdu. Empty string when it's Urdu/Arabic script (model mirrors fine) or
+    clearly plain English."""
+    if _ARABIC_RE.search(text):
+        return ""  # Urdu/Arabic script — let the model mirror the script
+    words = __import__("re").findall(r"[A-Za-z]+", text.lower())
+    if not words:
+        return ""
+    hits = sum(1 for w in words if w in _ROMAN_URDU_WORDS)
+    if hits >= 2 or (hits >= 1 and len(words) <= 4):
+        return (
+            "[LANGUAGE: The user wrote in ROMAN URDU (Urdu in Latin letters). You MUST "
+            "reply in Roman Urdu using Latin letters — do NOT reply in English and do NOT "
+            "switch to Urdu/Arabic script.]\n\n"
+        )
+    return ""
+
+
 # ================= SCHEMAS =================
 class Message(BaseModel):
     content: str = Field(..., min_length=1, max_length=4000)
@@ -414,6 +448,12 @@ async def chat(
     else:
         passages = []
     grounded_input = rag.build_grounded_input(user_input, passages)
+
+    # Force a Roman-Urdu reply when the user wrote Roman Urdu (the model sees this
+    # directive but it is NOT persisted as the user's message).
+    directive = _language_directive(user_input)
+    if directive:
+        grounded_input = directive + grounded_input
 
     # Guests (no token) or no DB -> stateless, nothing persisted.
     if not user_id or not _db_configured():
