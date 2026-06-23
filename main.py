@@ -89,6 +89,11 @@ HOW TO THINK BEFORE YOU ANSWER
 - Identify what is really being asked; if the question is ambiguous or the ruling
   depends on a detail (e.g. traveller vs resident, sane vs joking talaq), state the
   key condition or briefly ask for it instead of guessing.
+- FOLLOW-UPS: a short message like "urdu" / "in urdu" / "اردو میں" / "english" /
+  "explain" / "aur batao" / "tafseel" is an INSTRUCTION about your PREVIOUS answer in
+  this conversation — not a new question. Re-give or expand your previous answer on the
+  SAME topic in the requested language. NEVER jump to an unrelated subject on a follow-up;
+  always use the conversation history to know the current topic.
 - Lead with the ruling/answer, then the evidence and reasoning — not the other way round.
 - Match depth to the question: a simple question gets a short, direct answer; a complex
   mas'ala gets structure. Do NOT pad, repeat, or add filler. No flattery.
@@ -113,9 +118,16 @@ chat assistant; do NOT overuse it)
 ═══════════════════════════════════════════════════════════════════════
 LANGUAGE
 ═══════════════════════════════════════════════════════════════════════
-- Strickly Reply in the SAME language and script the user used (Urdu, Roman Urdu, English, Arabic).
-  Mirror their register; if they mix, mirror the mix.
-- If the user sends Salam, begin with "وعلیکم السلام" / "Wa Alaikum Assalam" then answer.
+- Reply in the SAME language AND script the user used. Decide carefully:
+    • Urdu script (اردو) → reply in Urdu script.
+    • ROMAN URDU = Urdu/Hindustani written in Latin letters (e.g. "talaq e salasa ka kya
+      hukum hai", "namaz parhne ka tareeqa") → reply in ROMAN URDU. This is NOT English —
+      NEVER answer Roman-Urdu questions in English.
+    • Plain English → reply in English.   • Arabic → reply in Arabic.
+  If the user mixes, mirror the mix.
+- GREET ONLY IF THE USER GREETS. Add "وعلیکم السلام / Wa Alaikum Assalam" ONLY when the
+  user's own message actually contains a salam (e.g. "assalam o alaikum", "السلام علیکم").
+  If there is NO salam in their message, do NOT add any salam — just answer directly.
 - Use respectful du'a phrases naturally (ﷺ for the Prophet, رضی اللہ عنہ, رحمۃ اللہ علیہ)
   without overdoing it.
 
@@ -191,6 +203,26 @@ def _encode_sources(passages) -> str:
     """Base64(JSON) so retrieved citations can ride along in a response header."""
     payload = json.dumps(rag.public_passages(passages), ensure_ascii=False)
     return base64.b64encode(payload.encode("utf-8")).decode("ascii")
+
+
+# Short follow-ups / meta-instructions that mean "act on the previous answer", not a
+# new topic — retrieving sources for these pulls in irrelevant context.
+_META_FOLLOWUPS = {
+    "urdu", "in urdu", "urdu me", "urdu mein", "اردو", "اردو میں",
+    "english", "in english", "translate", "translate it",
+    "explain", "explain more", "more", "detail", "details", "tafseel",
+    "aur batao", "aur btao", "summarize", "short", "continue",
+}
+
+
+def _should_retrieve(user_input: str) -> bool:
+    """Only run RAG for substantive questions, not bare follow-up commands."""
+    norm = user_input.strip().lower().rstrip("?.!۔؟ ")
+    if norm in _META_FOLLOWUPS:
+        return False
+    # Fewer than 3 words is almost never a real, source-worthy question and its
+    # embedding tends to match random seed sources.
+    return len(norm.split()) >= 3
 
 
 # ================= SCHEMAS =================
@@ -373,8 +405,14 @@ async def chat(
     user_input = body.content.strip()
     chat_id = body.chat_id
 
-    # RAG: retrieve supporting source passages and ground the prompt.
-    passages = await run_in_threadpool(rag.retrieve, user_input)
+    # RAG: retrieve supporting source passages and ground the prompt — but ONLY for
+    # substantive questions. Short / meta follow-ups like "urdu", "explain more",
+    # "in english" carry no topic, and embedding them pulls in random sources that
+    # derail the answer onto an unrelated subject.
+    if _should_retrieve(user_input):
+        passages = await run_in_threadpool(rag.retrieve, user_input)
+    else:
+        passages = []
     grounded_input = rag.build_grounded_input(user_input, passages)
 
     # Guests (no token) or no DB -> stateless, nothing persisted.
