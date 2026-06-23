@@ -383,6 +383,30 @@ def _chunk_text(chunk) -> str:
         return ""
 
 
+def _chunk_finish_reason(chunk):
+    """Best-effort read of a chunk's finish_reason (None if not present)."""
+    try:
+        fr = chunk.candidates[0].finish_reason
+        return fr if fr is not None else None
+    except Exception:
+        return None
+
+
+def _is_incomplete_finish(finish_reason) -> bool:
+    """True when generation stopped for any reason other than a clean STOP — e.g.
+    MAX_TOKENS, SAFETY, RECITATION. Those leave the answer cut off mid-thought."""
+    if finish_reason is None:
+        return False
+    name = getattr(finish_reason, "name", str(finish_reason))
+    return name not in ("STOP", "FINISH_REASON_UNSPECIFIED", "0", "1")
+
+
+def _is_quota_error(err_detail: str) -> bool:
+    """True for Gemini 429 / quota-exhaustion errors (vs. a generic failure)."""
+    d = err_detail.lower()
+    return "resourceexhausted" in d or "429" in d or "quota" in d
+
+
 def _stream_response(user_text: str, grounded_text: str, history, persist=None):
     """Stream chunks. `user_text` is persisted; `grounded_text` (with retrieved
     citations) is what the model actually sees. `persist` = (chat_id, user_id)."""
@@ -390,6 +414,7 @@ def _stream_response(user_text: str, grounded_text: str, history, persist=None):
     full = ""
     failed = False
     err_detail = ""
+    finish_reason = None
 
     try:
         response = model.generate_content(_to_gemini_contents(history, grounded_text), stream=True)
@@ -402,19 +427,52 @@ def _stream_response(user_text: str, grounded_text: str, history, persist=None):
             if text:
                 full += text
                 yield text
+            fr = _chunk_finish_reason(chunk)
+            if fr is not None:
+                finish_reason = fr
     except Exception as exc:
         failed = True
         err_detail = f"{type(exc).__name__}: {exc}"
         print(f"Generation error: {err_detail}")
 
-    # Only show the fallback if we produced NOTHING — never append it to a real answer.
+    incomplete = _is_incomplete_finish(finish_reason)
+    quota = _is_quota_error(err_detail)
+    debug = os.getenv("DEBUG_ERRORS") == "1"
+
     if not full and failed:
-        # Surface the error detail only when explicitly debugging.
-        suffix = f"\n\n[debug: {err_detail}]" if os.getenv("DEBUG_ERRORS") == "1" else ""
-        yield (
-            "معذرت، اس وقت جواب تیار کرنے میں دشواری ہو رہی ہے۔ / "
-            "Sorry, I could not generate a response right now. Please try again." + suffix
+        # Nothing was produced at all — show a full fallback message.
+        suffix = f"\n\n[debug: {err_detail}]" if debug else ""
+        if quota:
+            yield (
+                "معذرت، اس وقت سروس کی حد ختم ہو گئی ہے (Gemini quota)۔ "
+                "تھوڑی دیر بعد دوبارہ کوشش کریں۔ / "
+                "Sorry, the AI service is at its usage limit right now. "
+                "Please try again later." + suffix
+            )
+        else:
+            yield (
+                "معذرت، اس وقت جواب تیار کرنے میں دشواری ہو رہی ہے۔ / "
+                "Sorry, I could not generate a response right now. Please try again." + suffix
+            )
+    elif full and (failed or incomplete):
+        # We streamed PARTIAL text and then got cut off (mid-stream error, quota
+        # throttle, or a non-STOP finish like SAFETY/RECITATION/MAX_TOKENS).
+        # Tell the user instead of leaving a silently truncated answer.
+        suffix = f" [debug: {err_detail or finish_reason}]" if debug else ""
+        note = (
+            "\n\n⚠️ "
+            + (
+                "جواب سروس کی حد کی وجہ سے مکمل نہیں ہو سکا۔ / "
+                "The answer was cut off because the AI service hit its usage limit. "
+                if quota
+                else "جواب مکمل نہیں ہو سکا (سرور کی رکاوٹ)۔ / "
+                "The answer was cut off before it finished. "
+            )
+            + "براہِ کرم دوبارہ بھیجیں۔ / Please send the question again."
+            + suffix
         )
+        full += note
+        yield note
 
     # Persist the assistant reply separately so a DB hiccup can't corrupt the output.
     if persist and full:
