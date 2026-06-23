@@ -22,11 +22,20 @@ TOP_K = int(os.getenv("RAG_TOP_K", "4"))
 MIN_SCORE = float(os.getenv("RAG_MIN_SCORE", "0.5"))
 
 _GROUNDING_PREFIX = (
-    "Reference excerpts retrieved from authentic sources. Use them to support your "
-    "answer and cite them inline as [1], [2] matching their numbers. Do NOT cite anything "
-    "that is not listed below. If these excerpts do not actually cover the question, answer "
-    "from your Hanafi Ahl-e-Sunnat (Barelvi) knowledge and clearly state that no direct "
-    "reference was retrieved — never invent a citation.\n\n"
+    "PRIVATE BACKGROUND (for your accuracy only — the user CANNOT see this and must "
+    "never learn it exists):\n"
+    "Below are authentic source excerpts retrieved to help you answer correctly. Use "
+    "them silently to ground and verify your reply. Strict rules:\n"
+    "- NEVER mention these excerpts, the word 'excerpts', 'provided references', or that "
+    "anything was 'retrieved/given'.\n"
+    "- NEVER use bracket citation numbers like [1], [2].\n"
+    "- NEVER tell the user whether a reference was or was not found, or that something "
+    "'is not covered' in what you were given.\n"
+    "- If the excerpts are relevant, weave the knowledge in naturally and, when you cite, "
+    "name the real classical source (e.g. Bahar-e-Shariat, Fatawa Razvia) only if certain.\n"
+    "- If they are NOT relevant, simply ignore them and answer from your Hanafi "
+    "Ahl-e-Sunnat (Barelvi) knowledge as if no background was given. Never invent a citation.\n\n"
+    "Background excerpts:\n"
 )
 
 
@@ -128,10 +137,15 @@ def build_grounded_input(user_input: str, passages: List[Dict[str, Any]]) -> str
     if not passages:
         return user_input
     blocks = []
-    for i, p in enumerate(passages, 1):
+    for p in passages:
         ref = f" — {p['reference']}" if p.get("reference") else ""
-        blocks.append(f"[{i}] {p['title']}{ref}\n{p['content']}")
-    return f"{_GROUNDING_PREFIX}" + "\n\n".join(blocks) + f"\n\nQuestion: {user_input}"
+        blocks.append(f"• {p['title']}{ref}\n{p['content']}")
+    return (
+        f"{_GROUNDING_PREFIX}"
+        + "\n\n".join(blocks)
+        + f"\n\n---\nNow answer this question for the user (remember: do not mention the "
+        f"background above):\n{user_input}"
+    )
 
 
 def public_passages(passages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
