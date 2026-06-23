@@ -346,7 +346,7 @@ def _build_model() -> "genai.GenerativeModel":
         generation_config=genai.types.GenerationConfig(
             temperature=0.2,
             top_p=0.95,
-            max_output_tokens=int(os.getenv("MAX_OUTPUT_TOKENS", "2048")),
+            max_output_tokens=int(os.getenv("MAX_OUTPUT_TOKENS", "8192")),
         ),
     )
 
