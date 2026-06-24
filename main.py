@@ -28,6 +28,12 @@ api_key = (os.getenv("GEMINI_API_KEY") or "").strip() or None
 MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "60"))
 
+# Which LLM answers chat: "gemini" (default) or "groq". RAG embeddings always use
+# Gemini (Groq has no embeddings) and degrade soft if that key/quota is unavailable.
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini").strip().lower()
+GROQ_API_KEY = (os.getenv("GROQ_API_KEY") or "").strip() or None
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+
 if api_key:
     genai.configure(api_key=api_key)
 
@@ -37,6 +43,13 @@ def _db_configured() -> bool:
 
 
 def _gemini_configured() -> bool:
+    return bool(api_key)
+
+
+def _llm_configured() -> bool:
+    """The provider that actually answers chat must have a key."""
+    if LLM_PROVIDER == "groq":
+        return bool(GROQ_API_KEY)
     return bool(api_key)
 
 
@@ -283,10 +296,11 @@ async def root():
 async def health():
     return {
         "status": "healthy",
-        "api_key_configured": _gemini_configured(),
+        "api_key_configured": _llm_configured(),
         "auth_configured": auth_configured(),
         "db_configured": _db_configured(),
-        "model": MODEL_NAME,
+        "provider": LLM_PROVIDER,
+        "model": GROQ_MODEL if LLM_PROVIDER == "groq" else MODEL_NAME,
     }
 
 
@@ -393,41 +407,102 @@ def _chunk_finish_reason(chunk):
 
 
 def _is_incomplete_finish(finish_reason) -> bool:
-    """True when generation stopped for any reason other than a clean STOP — e.g.
-    MAX_TOKENS, SAFETY, RECITATION. Those leave the answer cut off mid-thought."""
+    """True when generation stopped for any reason other than a clean stop — e.g.
+    MAX_TOKENS/length, SAFETY, RECITATION, content_filter. Handles both Gemini's
+    enum and OpenAI/Groq's lowercase string ("stop"/"length"/"content_filter")."""
     if finish_reason is None:
         return False
-    name = getattr(finish_reason, "name", str(finish_reason))
-    return name not in ("STOP", "FINISH_REASON_UNSPECIFIED", "0", "1")
+    name = getattr(finish_reason, "name", str(finish_reason)).upper()
+    return name not in ("STOP", "FINISH_REASON_UNSPECIFIED", "0", "1", "END_TURN")
 
 
 def _is_quota_error(err_detail: str) -> bool:
-    """True for Gemini 429 / quota-exhaustion errors (vs. a generic failure)."""
+    """True for 429 / quota / rate-limit errors (Gemini or Groq) vs. a generic failure."""
     d = err_detail.lower()
-    return "resourceexhausted" in d or "429" in d or "quota" in d
+    return any(s in d for s in ("resourceexhausted", "429", "quota", "rate limit", "rate_limit"))
 
 
-def _stream_response(user_text: str, grounded_text: str, history, persist=None):
+def _to_openai_messages(history, user_input: str):
+    """Map system prompt + stored history to OpenAI/Groq chat message format."""
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    for msg in history[-MAX_HISTORY_MESSAGES:]:
+        role = "assistant" if msg["role"] == "assistant" else "user"
+        messages.append({"role": role, "content": msg["content"]})
+    messages.append({"role": "user", "content": user_input})
+    return messages
+
+
+def _gemini_chunks(grounded_text: str, history):
+    """Yield (text, finish_reason) from a Gemini streaming response."""
+    model = _build_model()
+    response = model.generate_content(_to_gemini_contents(history, grounded_text), stream=True)
+    for chunk in response:
+        yield _chunk_text(chunk), _chunk_finish_reason(chunk)
+
+
+def _groq_chunks(grounded_text: str, history):
+    """Yield (text, finish_reason) from Groq's OpenAI-compatible SSE stream.
+
+    We read the stream as raw bytes and decode each line as UTF-8 ourselves
+    instead of using an HTTP client's text auto-detection: while streaming,
+    that detection latches onto the leading ASCII (e.g. "**") and decodes the
+    rest as ASCII, mangling all the Urdu/Arabic into '?'. Manual UTF-8 is exact."""
+    import requests
+
+    resp = requests.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+        json={
+            "model": GROQ_MODEL,
+            "messages": _to_openai_messages(history, grounded_text),
+            "temperature": 0.2,
+            "top_p": 0.95,
+            "max_tokens": int(os.getenv("MAX_OUTPUT_TOKENS", "8192")),
+            "stream": True,
+        },
+        stream=True,
+        timeout=120,
+    )
+    resp.raise_for_status()
+    # iter_lines on raw bytes is UTF-8-safe: 0x0A never appears mid-character.
+    for raw_line in resp.iter_lines(decode_unicode=False):
+        if not raw_line:
+            continue
+        line = raw_line.decode("utf-8", "replace")
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if data == "[DONE]":
+            break
+        try:
+            choices = json.loads(data).get("choices") or []
+        except ValueError:
+            continue
+        if not choices:
+            continue
+        choice = choices[0]
+        text = (choice.get("delta") or {}).get("content") or ""
+        yield text, choice.get("finish_reason")
+
+
+def _stream_text(user_text: str, grounded_text: str, history, persist=None):
     """Stream chunks. `user_text` is persisted; `grounded_text` (with retrieved
     citations) is what the model actually sees. `persist` = (chat_id, user_id)."""
-    model = _build_model()
     full = ""
     failed = False
     err_detail = ""
     finish_reason = None
+    chunk_source = _groq_chunks if LLM_PROVIDER == "groq" else _gemini_chunks
 
     try:
-        response = model.generate_content(_to_gemini_contents(history, grounded_text), stream=True)
         if persist:
             chat_id, user_id = persist
             db.MessageRepository.create_message(chat_id, user_id, "user", user_text)
 
-        for chunk in response:
-            text = _chunk_text(chunk)
+        for text, fr in chunk_source(grounded_text, history):
             if text:
                 full += text
                 yield text
-            fr = _chunk_finish_reason(chunk)
             if fr is not None:
                 finish_reason = fr
     except Exception as exc:
@@ -444,10 +519,10 @@ def _stream_response(user_text: str, grounded_text: str, history, persist=None):
         suffix = f"\n\n[debug: {err_detail}]" if debug else ""
         if quota:
             yield (
-                "معذرت، اس وقت سروس کی حد ختم ہو گئی ہے (Gemini quota)۔ "
-                "تھوڑی دیر بعد دوبارہ کوشش کریں۔ / "
-                "Sorry, the AI service is at its usage limit right now. "
-                "Please try again later." + suffix
+                "معذرت، اس وقت سروس کی حد (rate limit) عبور ہو گئی ہے۔ "
+                "تھوڑی دیر (تقریباً ایک منٹ) بعد دوبارہ کوشش کریں۔ / "
+                "Sorry, the AI service hit its rate limit. "
+                "Please try again in a minute." + suffix
             )
         else:
             yield (
@@ -483,6 +558,13 @@ def _stream_response(user_text: str, grounded_text: str, history, persist=None):
             print(f"Persist assistant message failed: {exc}")
 
 
+def _stream_response(user_text: str, grounded_text: str, history, persist=None):
+    """Encode each chunk to UTF-8 bytes ourselves so the ASGI layer never re-encodes
+    the stream with a platform-default charset (which mangled Urdu/Arabic to '?')."""
+    for piece in _stream_text(user_text, grounded_text, history, persist):
+        yield piece.encode("utf-8")
+
+
 # ================= CHAT =================
 @app.post("/chat")
 @limiter.limit("20/minute")
@@ -491,8 +573,9 @@ async def chat(
     body: Message,
     user_id: Optional[str] = Depends(get_optional_user_id),
 ):
-    if not _gemini_configured():
-        raise HTTPException(status_code=503, detail="Server missing GEMINI_API_KEY")
+    if not _llm_configured():
+        missing = "GROQ_API_KEY" if LLM_PROVIDER == "groq" else "GEMINI_API_KEY"
+        raise HTTPException(status_code=503, detail=f"Server missing {missing}")
 
     user_input = body.content.strip()
     chat_id = body.chat_id
