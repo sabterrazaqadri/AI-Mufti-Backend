@@ -36,16 +36,22 @@ def get_cursor(commit: bool = False):
     """Borrow a pooled connection and yield a cursor, returning it afterwards."""
     pool = _get_pool()
     conn = pool.getconn()
+    # Neon (serverless) closes idle connections, so a pooled handle can be dead
+    # by the time it's borrowed again — swap dead handles for fresh ones.
+    while conn.closed:
+        pool.putconn(conn, close=True)
+        conn = pool.getconn()
     try:
         with conn.cursor() as cur:
             yield cur
         if commit:
             conn.commit()
     except Exception:
-        conn.rollback()
+        if not conn.closed:
+            conn.rollback()
         raise
     finally:
-        pool.putconn(conn)
+        pool.putconn(conn, close=bool(conn.closed))
 
 
 def init_db():

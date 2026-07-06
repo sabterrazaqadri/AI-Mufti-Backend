@@ -183,10 +183,12 @@ def main():
         if done.get(page_name):
             continue
         # Re-running a page after a crash: clear its rows first (no duplicates).
+        # The jild tag is essential: page file names repeat across jilds, and
+        # without it ingesting Jild 2's page_001 deletes Jild 1's page_001 rows.
         with db.get_cursor(commit=True) as cur:
             cur.execute(
-                "DELETE FROM sources WHERE %s = ANY(tags) AND %s = ANY(tags);",
-                (book_tag, page_name),
+                "DELETE FROM sources WHERE %s = ANY(tags) AND %s = ANY(tags) AND %s = ANY(tags);",
+                (book_tag, f"jild-{args.jild}", page_name),
             )
         batches, cur_batch, cur_chars = [], [], 0
         for c in page_chunks:
@@ -211,10 +213,21 @@ def main():
                 print(f"Stopped at {page_name} (quota?). Re-run later to resume.")
                 return
             for c, v in zip(batch, vecs):
-                rag.add_source_with_vector(
-                    title=c["title"], content=c["content"], vec=v,
-                    reference=c["reference"], lang="ur", tags=c["tags"],
-                )
+                # The dead pooled handle is discarded on the next borrow, so a
+                # retry after a dropped Neon connection gets a fresh one.
+                for db_attempt in range(3):
+                    try:
+                        rag.add_source_with_vector(
+                            title=c["title"], content=c["content"], vec=v,
+                            reference=c["reference"], lang="ur", tags=c["tags"],
+                        )
+                        break
+                    except Exception as exc:
+                        print(f"  db insert failed ({exc}); retry in 10s")
+                        time.sleep(10)
+                else:
+                    print(f"Stopped at {page_name} (db). Re-run later to resume.")
+                    return
             time.sleep(BATCH_SLEEP)
         done[page_name] = len(page_chunks)
         ckpt_path.write_text(json.dumps(done, ensure_ascii=False, indent=1), encoding="utf-8")
