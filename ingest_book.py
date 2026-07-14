@@ -26,6 +26,40 @@ from pathlib import Path
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
+# Load .env before reading environment variables
+from dotenv import load_dotenv
+load_dotenv()
+
+# ---- Key rotation for multi-key ingestion (ONLY INGESTION_KEY_1 through 4) ----
+# STRICT RULE: main GEMINI_API_KEY is NEVER used
+INGESTION_KEYS = []
+
+# Add INGESTION_KEY_1 through INGESTION_KEY_4 only (skip 5, skip main key)
+for i in range(1, 5):
+    key = os.getenv(f"INGESTION_KEY_{i}", "").strip()
+    if key:
+        INGESTION_KEYS.append((f"INGESTION_KEY_{i}", key))
+
+_current_key_index = 0
+
+def get_current_key():
+    global _current_key_index
+    if _current_key_index >= len(INGESTION_KEYS):
+        return None
+    return INGESTION_KEYS[_current_key_index][1]
+
+def next_key():
+    global _current_key_index
+    _current_key_index += 1
+    if _current_key_index >= len(INGESTION_KEYS):
+        return None
+
+    key_name, key_value = INGESTION_KEYS[_current_key_index]
+    import google.generativeai as genai
+    genai.configure(api_key=key_value)
+    print(f"[KEY ROTATION] Switched to {key_name} ({_current_key_index}/{len(INGESTION_KEYS)} keys)")
+    return key_value
+
 TARGET_CHUNK = 1500   # chars; masail are packed up to this size
 MAX_CHUNK = 3000      # a single masla longer than this is split at sentence ends
 OVERLAP = 200         # overlap when force-splitting oversized text
@@ -109,8 +143,18 @@ def build_chunks(pages_dir: Path, book: str, jild: int, book_tag: str):
 
         for heading, section in split_babs(page_heading, body.strip()):
 
+            page_match = re.search(r"(\d+)", path.stem)
+            page_num = int(page_match.group(1)) if page_match else None
+
             def ref(nums):
-                parts = [book, f"Jild {jild}", heading]
+                parts = [book, f"Jild {jild}"]
+                # The page heading defaults to "بہارِ شریعت" when the page has no
+                # real bab line (e.g. Sirat-ul-Jinan tafseer pages) — that is a
+                # placeholder, not a locator, so drop it and rely on the safha.
+                if heading and heading != "بہارِ شریعت":
+                    parts.append(heading)
+                if page_num is not None:
+                    parts.append(f"صفحہ {page_num}")
                 if nums:
                     lo, hi = min(nums), max(nums)
                     parts.append(f"مسئلہ {lo}" if lo == hi else f"مسئلہ {lo}-{hi}")
@@ -147,6 +191,8 @@ def build_chunks(pages_dir: Path, book: str, jild: int, book_tag: str):
 
 
 def main():
+    global _current_key_index
+
     ap = argparse.ArgumentParser()
     ap.add_argument("pages_dir")
     ap.add_argument("--book", default="Bahar-e-Shariat")
@@ -167,9 +213,16 @@ def main():
 
     import database as db
     import rag
+    import google.generativeai as genai
 
     db.init_db()
     rag.init_rag()
+
+    # Initialize with first key (main GEMINI_API_KEY or first ingestion key)
+    if INGESTION_KEYS:
+        key_name, key_value = INGESTION_KEYS[0]
+        genai.configure(api_key=key_value)
+        print(f"[KEY ROTATION] Starting with {key_name} (1/{len(INGESTION_KEYS)} keys)")
 
     ckpt_path = pages_dir / "ingest_checkpoint.json"
     done = json.loads(ckpt_path.read_text(encoding="utf-8")) if ckpt_path.exists() else {}
@@ -206,6 +259,17 @@ def main():
                     vecs = rag.embed_batch([c["content"] for c in batch])
                     break
                 except Exception as exc:
+                    exc_str = str(exc)
+                    # Check if 429 quota error — try next key instead of waiting
+                    if "429" in exc_str or "You exceeded your current quota" in exc_str:
+                        new_key = next_key()
+                        if not new_key:
+                            print(f"Stopped at {page_name} (all keys exhausted). Re-run later to resume.")
+                            return
+                        print(f"  {exc_str[:80]}... Trying next key.")
+                        time.sleep(2)  # brief pause before retry with new key
+                        continue
+                    # Non-quota error: exponential backoff
                     wait = 30 * (attempt + 1)
                     print(f"  embed failed ({exc}); retry in {wait}s")
                     time.sleep(wait)

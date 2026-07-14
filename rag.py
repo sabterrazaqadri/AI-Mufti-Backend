@@ -27,25 +27,48 @@ if _api_key:
 EMBED_MODEL = os.getenv("EMBED_MODEL", "models/gemini-embedding-001")
 EMBED_DIM = int(os.getenv("EMBED_DIM", "768"))
 TOP_K = int(os.getenv("RAG_TOP_K", "6"))
-# cosine similarity (1 - distance); 0..1. Tune per corpus.
-MIN_SCORE = float(os.getenv("RAG_MIN_SCORE", "0.5"))
+# cosine similarity (1 - distance); 0..1. Measured on this corpus: genuine fiqh
+# masail score ~0.75-0.80 against the books, while off-topic queries (weather,
+# sports, crypto) top out ~0.66. 0.70 cleanly separates them so we only answer
+# when a real source backs the question and otherwise refuse ("koi mustanad hawala nahi").
+MIN_SCORE = float(os.getenv("RAG_MIN_SCORE", "0.70"))
 
 _GROUNDING_PREFIX = (
     "PRIVATE BACKGROUND (for your accuracy only — the user CANNOT see this and must "
     "never learn it exists):\n"
-    "Below are authentic source excerpts retrieved to help you answer correctly. Use "
-    "them silently to ground and verify your reply. Strict rules:\n"
-    "- NEVER mention these excerpts, the word 'excerpts', 'provided references', or that "
-    "anything was 'retrieved/given'.\n"
+    "Below are authentic source excerpts retrieved from the AI Mufti library to answer "
+    "this question. You MUST base your ruling ONLY on these excerpts. Strict rules:\n"
+    "- Ground the ENTIRE answer in these excerpts. Do NOT add any ruling, condition, verse, "
+    "hadith, or detail from your own memory that is not supported by them.\n"
+    "- NEVER mention these excerpts, the words 'excerpts'/'sources'/'library', 'provided "
+    "references', or that anything was 'retrieved/given'.\n"
     "- NEVER use bracket citation numbers like [1], [2].\n"
-    "- NEVER tell the user whether a reference was or was not found, or that something "
-    "'is not covered' in what you were given.\n"
-    "- If the excerpts are relevant, weave the knowledge in naturally. When you cite an "
-    "excerpt's source, copy its reference line EXACTLY as given (book, jild/hissa, bab, "
-    "masla number) — never alter it, never add a page/volume number of your own.\n"
-    "- If they are NOT relevant, simply ignore them and answer from your Hanafi "
-    "Ahl-e-Sunnat (Barelvi) knowledge as if no background was given. Never invent a citation.\n\n"
+    "- When you cite a source, copy its reference line EXACTLY as given (book, jild/hissa, "
+    "bab, safha/masla number) — never alter it, never add a page/volume number of your own.\n"
+    "- If the excerpts only PARTLY cover the question, answer the covered part from them and, "
+    "for the uncovered part, plainly say you have no mustanad reference for it right now — "
+    "do NOT fill the gap from memory and do NOT invent a citation.\n\n"
     "Background excerpts:\n"
+)
+
+# Used when retrieval WAS attempted for a substantive question but nothing relevant was
+# found: the model must refuse rather than answer a fiqh mas'ala from unverified memory.
+_NO_SOURCE_DIRECTIVE = (
+    "PRIVATE BACKGROUND (the user CANNOT see this and must never learn it exists):\n"
+    "No authentic source excerpt was found in the AI Mufti library for this question.\n"
+    "RULES:\n"
+    "- If this is a substantive Islamic question or mas'ala, you MUST NOT answer it from "
+    "your own memory and MUST NOT give any ruling, verse, hadith, or citation. Reply with "
+    "ONLY the refusal below, in the SAME language/script the user used:\n"
+    "    • Urdu script: معذرت، میرے پاس اس وقت اس مسئلے پر کوئی مستند حوالہ نہیں۔\n"
+    "    • Roman Urdu: Muazrat, mere paas is waqt is mas'ale par koi mustanad hawala nahi.\n"
+    "    • English: Sorry, I do not have an authentic reference on this matter right now.\n"
+    "- EXCEPTION — the refusal does NOT apply if the user's message is only a greeting/salam, "
+    "a thank-you, an identity question (your name or creator), or a meta/language follow-up "
+    "(e.g. 'in urdu', 'explain'). In those cases respond normally per your other instructions.\n"
+    "- Do NOT mention sources, a library, retrieval, or that anything was or wasn't found — "
+    "say nothing beyond the refusal sentence itself.\n\n"
+    "---\nUser's message:\n"
 )
 
 
@@ -231,9 +254,22 @@ def retrieve(query: str, k: int = TOP_K, min_score: float = MIN_SCORE) -> List[D
     return [r for r in rows[:k] if float(r.get("score") or 0) >= min_score]
 
 
-def build_grounded_input(user_input: str, passages: List[Dict[str, Any]]) -> str:
-    """Wrap the user's question with numbered reference excerpts for the model."""
+def build_grounded_input(
+    user_input: str,
+    passages: List[Dict[str, Any]],
+    retrieval_attempted: bool = False,
+) -> str:
+    """Wrap the user's question with reference excerpts for the model.
+
+    - passages present  → ground the answer strictly in them.
+    - no passages, retrieval WAS attempted → instruct the model to refuse (no
+      mustanad reference), so fiqh masail are never answered from raw memory.
+    - no passages, retrieval NOT attempted (meta/short follow-up) → pass through
+      untouched so language/expand follow-ups still work.
+    """
     if not passages:
+        if retrieval_attempted:
+            return f"{_NO_SOURCE_DIRECTIVE}{user_input}"
         return user_input
     blocks = []
     for p in passages:
