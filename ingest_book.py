@@ -139,7 +139,11 @@ def build_chunks(pages_dir: Path, book: str, jild: int, book_tag: str):
     for path in sorted(pages_dir.glob("page_*.txt")):
         raw = path.read_text(encoding="utf-8")
         page_heading, _, body = raw.partition("\n")
-        page_heading = page_heading.strip() or "بہارِ شریعت"
+        # May be empty (many pages have no standalone bab title on the first
+        # line). Do NOT fall back to a book name here — that leaks one book's
+        # title into another book's citations (e.g. Qanoon rows once read
+        # "…بہارِ شریعت"). Empty heading → the ref just uses the safha.
+        page_heading = page_heading.strip()
 
         for heading, section in split_babs(page_heading, body.strip()):
 
