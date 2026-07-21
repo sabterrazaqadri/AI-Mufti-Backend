@@ -346,6 +346,76 @@ async def health():
     }
 
 
+# ================= LIBRARY (public, browsable) =================
+# Read-only views over the ingested corpus. Public on purpose: these pages are the
+# product's proof of authenticity and its indexable surface.
+
+@app.get("/api/library/books")
+async def library_books():
+    """Every ingested book with its passage count, newest ingestion first."""
+    def _query():
+        with db.get_cursor() as cur:
+            cur.execute(
+                """
+                SELECT tags[1] AS slug,
+                       split_part(MIN(reference), ',', 1) AS name,
+                       COUNT(*) AS passages
+                FROM sources
+                WHERE tags IS NOT NULL AND array_length(tags, 1) >= 1
+                GROUP BY tags[1]
+                ORDER BY passages DESC;
+                """
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    try:
+        return {"books": await run_in_threadpool(_query)}
+    except Exception as exc:
+        print(f"library_books failed: {exc}")
+        raise HTTPException(status_code=503, detail="Library unavailable")
+
+
+@app.get("/api/library/books/{slug}")
+async def library_book(slug: str, page: int = 1, per_page: int = 20):
+    """One book's passages, in ingestion (i.e. page) order."""
+    page = max(1, page)
+    per_page = min(max(1, per_page), 50)
+
+    def _query():
+        with db.get_cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS n FROM sources WHERE tags[1] = %s;", (slug,))
+            total = int(cur.fetchone()["n"])
+            cur.execute(
+                """
+                SELECT title, reference, content
+                FROM sources
+                WHERE tags[1] = %s
+                ORDER BY created_at, id
+                LIMIT %s OFFSET %s;
+                """,
+                (slug, per_page, (page - 1) * per_page),
+            )
+            return total, [dict(r) for r in cur.fetchall()]
+
+    try:
+        total, rows = await run_in_threadpool(_query)
+    except Exception as exc:
+        print(f"library_book failed: {exc}")
+        raise HTTPException(status_code=503, detail="Library unavailable")
+    if not total:
+        raise HTTPException(status_code=404, detail="Book not found")
+    name = (rows[0]["reference"] or slug).split(",")[0] if rows else slug
+    return {
+        "slug": slug,
+        "name": name,
+        "total": total,
+        "page": page,
+        "per_page": per_page,
+        "pages": (total + per_page - 1) // per_page,
+        "passages": rows,
+    }
+
+
 # ================= CHAT HISTORY (auth required) =================
 @app.get("/api/chats")
 async def get_chats(user_id: str = Depends(get_current_user_id)):
