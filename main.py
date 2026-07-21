@@ -347,29 +347,182 @@ async def health():
 
 
 # ================= LIBRARY (public, browsable) =================
+# ---- Categories -----------------------------------------------------------
+# The shelf a book sits on. Kept here, in one place, rather than in the frontend
+# so the whole library is described by the backend that owns the corpus.
+#
+# ADDING A BOOK: ingest it, and it appears in the library on its own — counts,
+# listings and the sitemap all read from the database. The ONLY thing this file
+# controls is which shelf it lands on. A book missing from BOOK_CATEGORIES is
+# not hidden; it falls into "mutafarriq" (Other) until it is listed here.
+
+CATEGORIES = [
+    {
+        "slug": "quran-o-tafseer",
+        "name": "Qur'an & Tafseer",
+        "urdu": "قرآن و تفسیر",
+        "desc": "The Qur'an al-Kareem and its commentary.",
+    },
+    {
+        "slug": "hadees",
+        "name": "Hadith",
+        "urdu": "حدیث",
+        "desc": "Hadith collections, their commentary, and the principles of narration.",
+    },
+    {
+        "slug": "fiqh-o-fatawa",
+        "name": "Fiqh & Fatawa",
+        "urdu": "فقہ و فتاویٰ",
+        "desc": "Hanafi rulings, published fatawa, and the principles they rest on.",
+    },
+    {
+        "slug": "aqaid",
+        "name": "Aqaid",
+        "urdu": "عقائد",
+        "desc": "Belief, and the Ahl-e-Sunnat position on the matters that divide it.",
+    },
+    {
+        "slug": "seerat-o-sawaneh",
+        "name": "Seerat & Biography",
+        "urdu": "سیرت و سوانح",
+        "desc": "The life of the Prophet ﷺ, the anbiya, and the scholars who followed.",
+    },
+    {
+        "slug": "tasawwuf-o-akhlaq",
+        "name": "Tasawwuf & Akhlaq",
+        "urdu": "تصوف و اخلاق",
+        "desc": "The purification of the self and the manners of a Muslim.",
+    },
+    {
+        "slug": "darsi-kutub",
+        "name": "Darsi Kutub",
+        "urdu": "درسی کتب",
+        "desc": "The madrasa syllabus — nahw, sarf, mantiq and Arabic adab.",
+    },
+    {
+        "slug": "mutafarriq",
+        "name": "Other",
+        "urdu": "متفرق",
+        "desc": "Books not yet placed on a shelf.",
+    },
+]
+
+DEFAULT_CATEGORY = "mutafarriq"
+
+BOOK_CATEGORIES = {
+    "al-quran-ul-kareem": "quran-o-tafseer",
+    "sirat-ul-jinan": "quran-o-tafseer",
+
+    "miraat-ul-manajeeh": "hadees",
+    "anwaar-ul-hadees": "hadees",
+    "kalam-e-raza-me-ahadees-ke-jalwe": "hadees",
+    "nisab-e-usool-e-hadees-ma-ifadaat-e-razawiya": "hadees",
+
+    "bahar-e-shariat": "fiqh-o-fatawa",
+    "fatawa-razawiyya": "fiqh-o-fatawa",
+    "qanoon-e-shariat": "fiqh-o-fatawa",
+    "khulasa-tul-faraiz": "fiqh-o-fatawa",
+    "aala-hazrat-say-sawal-jawab": "fiqh-o-fatawa",
+    "talkhees-usool-ul-shashi": "fiqh-o-fatawa",
+
+    "ja-al-haq": "aqaid",
+    "al-haqq-ul-mubeen": "aqaid",
+    "kitab-ul-aqiad": "aqaid",
+    "aqaid-e-nasafi": "aqaid",
+
+    "seerat-e-rasool-e-arabi": "seerat-o-sawaneh",
+    "seerat-ul-anbiya": "seerat-o-sawaneh",
+    "faizan-e-mufti-azam-hind": "seerat-o-sawaneh",
+
+    "ihya-ul-uloom-mutarjam": "tasawwuf-o-akhlaq",
+
+    "nisab-ul-nahw": "darsi-kutub",
+    "nisab-us-sarf": "darsi-kutub",
+    "jame-abwab-us-sarf": "darsi-kutub",
+    "miata-aamil-manzom": "darsi-kutub",
+    "jawahir-ul-mantiq": "darsi-kutub",
+    "itqan-ul-firaasah-fi-sharah-deewanil-hamasa": "darsi-kutub",
+}
+
+_CATEGORY_BY_SLUG = {c["slug"]: c for c in CATEGORIES}
+
+
+def _book_rows():
+    """Every ingested book with its passage count and shelf."""
+    with db.get_cursor() as cur:
+        cur.execute(
+            """
+            SELECT tags[1] AS slug,
+                   split_part(MIN(reference), ',', 1) AS name,
+                   COUNT(*) AS passages
+            FROM sources
+            WHERE tags IS NOT NULL AND array_length(tags, 1) >= 1
+            GROUP BY tags[1]
+            ORDER BY passages DESC;
+            """
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+    for r in rows:
+        r["category"] = BOOK_CATEGORIES.get(r["slug"], DEFAULT_CATEGORY)
+    return rows
+
+
+@app.get("/api/library/categories")
+async def library_categories():
+    """Shelves, each with the books on it. Empty shelves are omitted."""
+    try:
+        rows = await run_in_threadpool(_book_rows)
+    except Exception as exc:
+        print(f"library_categories failed: {exc}")
+        raise HTTPException(status_code=503, detail="Library unavailable")
+
+    grouped = {}
+    for r in rows:
+        grouped.setdefault(r["category"], []).append(r)
+
+    out = []
+    for cat in CATEGORIES:
+        books = grouped.get(cat["slug"], [])
+        if not books:
+            continue
+        out.append({
+            **cat,
+            "books": books,
+            "book_count": len(books),
+            "passages": sum(int(b["passages"]) for b in books),
+        })
+    return {"categories": out}
+
+
+@app.get("/api/library/categories/{category}")
+async def library_category(category: str):
+    """One shelf and everything on it."""
+    cat = _CATEGORY_BY_SLUG.get(category)
+    if not cat:
+        raise HTTPException(status_code=404, detail="Category not found")
+    try:
+        rows = await run_in_threadpool(_book_rows)
+    except Exception as exc:
+        print(f"library_category failed: {exc}")
+        raise HTTPException(status_code=503, detail="Library unavailable")
+
+    books = [r for r in rows if r["category"] == category]
+    if not books:
+        raise HTTPException(status_code=404, detail="Category is empty")
+    return {
+        **cat,
+        "books": books,
+        "book_count": len(books),
+        "passages": sum(int(b["passages"]) for b in books),
+    }
 # Read-only views over the ingested corpus. Public on purpose: these pages are the
 # product's proof of authenticity and its indexable surface.
 
 @app.get("/api/library/books")
 async def library_books():
-    """Every ingested book with its passage count, newest ingestion first."""
-    def _query():
-        with db.get_cursor() as cur:
-            cur.execute(
-                """
-                SELECT tags[1] AS slug,
-                       split_part(MIN(reference), ',', 1) AS name,
-                       COUNT(*) AS passages
-                FROM sources
-                WHERE tags IS NOT NULL AND array_length(tags, 1) >= 1
-                GROUP BY tags[1]
-                ORDER BY passages DESC;
-                """
-            )
-            return [dict(r) for r in cur.fetchall()]
-
+    """Every ingested book with its passage count and category, largest first."""
     try:
-        return {"books": await run_in_threadpool(_query)}
+        return {"books": await run_in_threadpool(_book_rows)}
     except Exception as exc:
         print(f"library_books failed: {exc}")
         raise HTTPException(status_code=503, detail="Library unavailable")
@@ -413,9 +566,11 @@ async def library_book(slug: str):
         raise HTTPException(status_code=503, detail="Library unavailable")
     if not rows:
         raise HTTPException(status_code=404, detail="Book not found")
+    cat_slug = BOOK_CATEGORIES.get(slug, DEFAULT_CATEGORY)
     return {
         "slug": slug,
         "name": rows[0]["name"] or slug,
+        "category": _CATEGORY_BY_SLUG.get(cat_slug, {}),
         "has_safha": any(r["has_safha"] for r in rows),
         "jilds": [
             {"jild": r["jild"], "pages": r["pages"], "passages": r["passages"]} for r in rows
