@@ -283,7 +283,8 @@ def _search(qvec: List[float], k: int) -> List[Dict[str, Any]]:
         cur.execute("SET LOCAL ivfflat.probes = %s;", (int(os.getenv("RAG_PROBES", "16")),))
         cur.execute(
             """
-            SELECT title, reference, content, lang, tags[1] AS slug,
+            SELECT title, reference, content, lang, tags[1] AS slug, tags[2] AS jild_tag,
+                   tags[3] AS page_tag,
                    1 - (embedding <=> %s::vector) AS score
             FROM sources
             ORDER BY embedding <=> %s::vector
@@ -398,7 +399,8 @@ def browse(tags, needle: Optional[str], k: int = 3) -> List[Dict[str, Any]]:
     try:
         with db.get_cursor() as cur:
             cur.execute(
-                f"SELECT title, reference, content, lang, tags[1] AS slug, 1.0 AS score "
+                f"SELECT title, reference, content, lang, tags[1] AS slug, "
+                f"tags[2] AS jild_tag, tags[3] AS page_tag, 1.0 AS score "
                 f"FROM sources{clause} ORDER BY random() LIMIT %s;",
                 params,
             )
@@ -438,6 +440,14 @@ def build_grounded_input(
     )
 
 
+def _digits(tag: Optional[str]) -> Optional[int]:
+    """'jild-2' → 2, 'page_0048.txt' → 48. None when the tag is missing/odd."""
+    if not tag:
+        return None
+    d = re.sub(r"\D", "", tag)
+    return int(d) if d else None
+
+
 def public_passages(passages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Trimmed, JSON-safe shape for the frontend Sources panel."""
     out = []
@@ -450,8 +460,11 @@ def public_passages(passages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "title": p.get("title"),
                 "reference": p.get("reference"),
                 "content": content,
-                # Book tag, so the UI can link a citation to its /library page.
+                # Book/volume/page, so a citation can deep-link to the exact
+                # original page it was taken from.
                 "slug": p.get("slug"),
+                "jild": _digits(p.get("jild_tag")),
+                "page": _digits(p.get("page_tag")),
                 "score": round(float(p.get("score") or 0), 3),
             }
         )

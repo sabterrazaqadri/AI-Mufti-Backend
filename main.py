@@ -375,44 +375,153 @@ async def library_books():
         raise HTTPException(status_code=503, detail="Library unavailable")
 
 
-@app.get("/api/library/books/{slug}")
-async def library_book(slug: str, page: int = 1, per_page: int = 20):
-    """One book's passages, in ingestion (i.e. page) order."""
-    page = max(1, page)
-    per_page = min(max(1, per_page), 50)
+# Every book was ingested with tags = [book-slug, 'jild-N', 'page_NNN.txt'], so the
+# original page structure is fully recoverable. Digits are pulled out rather than
+# parsed positionally because zero-padding varies between books (page_001 vs page_0001).
+_JILD_NUM = "(regexp_replace(tags[2], '\\D', '', 'g'))::int"
+_PAGE_NUM = "(regexp_replace(tags[3], '\\D', '', 'g'))::int"
 
+
+@app.get("/api/library/books/{slug}")
+async def library_book(slug: str):
+    """A book's volumes, each with its page count — the shelf view."""
     def _query():
         with db.get_cursor() as cur:
-            cur.execute("SELECT COUNT(*) AS n FROM sources WHERE tags[1] = %s;", (slug,))
-            total = int(cur.fetchone()["n"])
             cur.execute(
-                """
-                SELECT title, reference, content
+                f"""
+                SELECT {_JILD_NUM} AS jild,
+                       COUNT(DISTINCT tags[3]) AS pages,
+                       COUNT(*) AS passages,
+                       split_part(MIN(reference), ',', 1) AS name,
+                       -- Books scraped by section (e.g. Bahar-e-Shariat) carry no
+                       -- printed page number, so the UI must not call their unit a
+                       -- "safha" when the source never claimed one.
+                       bool_or(reference LIKE '%%صفحہ%%') AS has_safha
                 FROM sources
-                WHERE tags[1] = %s
-                ORDER BY created_at, id
-                LIMIT %s OFFSET %s;
+                WHERE tags[1] = %s AND array_length(tags, 1) >= 3
+                GROUP BY 1
+                ORDER BY 1;
                 """,
-                (slug, per_page, (page - 1) * per_page),
+                (slug,),
             )
-            return total, [dict(r) for r in cur.fetchall()]
+            return [dict(r) for r in cur.fetchall()]
 
     try:
-        total, rows = await run_in_threadpool(_query)
+        rows = await run_in_threadpool(_query)
     except Exception as exc:
         print(f"library_book failed: {exc}")
         raise HTTPException(status_code=503, detail="Library unavailable")
-    if not total:
+    if not rows:
         raise HTTPException(status_code=404, detail="Book not found")
-    name = (rows[0]["reference"] or slug).split(",")[0] if rows else slug
+    return {
+        "slug": slug,
+        "name": rows[0]["name"] or slug,
+        "has_safha": any(r["has_safha"] for r in rows),
+        "jilds": [
+            {"jild": r["jild"], "pages": r["pages"], "passages": r["passages"]} for r in rows
+        ],
+        "total_pages": sum(r["pages"] for r in rows),
+        "total_passages": sum(r["passages"] for r in rows),
+    }
+
+
+@app.get("/api/library/books/{slug}/{jild}")
+async def library_jild(slug: str, jild: int):
+    """Every page in one volume, with the heading it opens on."""
+    def _query():
+        with db.get_cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT {_PAGE_NUM} AS page,
+                       (array_agg(title ORDER BY created_at, id))[1] AS heading,
+                       COUNT(*) AS passages
+                FROM sources
+                WHERE tags[1] = %s AND {_JILD_NUM} = %s AND array_length(tags, 1) >= 3
+                GROUP BY 1
+                ORDER BY 1;
+                """,
+                (slug, jild),
+            )
+            pages = [dict(r) for r in cur.fetchall()]
+            cur.execute(
+                """
+                SELECT split_part(MIN(reference), ',', 1) AS name,
+                       bool_or(reference LIKE '%%صفحہ%%') AS has_safha
+                FROM sources WHERE tags[1] = %s;
+                """,
+                (slug,),
+            )
+            return pages, dict(cur.fetchone() or {})
+
+    try:
+        pages, meta = await run_in_threadpool(_query)
+    except Exception as exc:
+        print(f"library_jild failed: {exc}")
+        raise HTTPException(status_code=503, detail="Library unavailable")
+    if not pages:
+        raise HTTPException(status_code=404, detail="Volume not found")
+    return {
+        "slug": slug,
+        "name": meta.get("name") or slug,
+        "has_safha": bool(meta.get("has_safha")),
+        "jild": jild,
+        "pages": pages,
+    }
+
+
+@app.get("/api/library/books/{slug}/{jild}/{page}")
+async def library_page(slug: str, jild: int, page: int):
+    """One original page, rebuilt from its passages in the order they appear on it.
+
+    This is the deepest view in the library: the actual text of the printed page a
+    citation points at, so a reader can check a ruling against its source."""
+    def _query():
+        with db.get_cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT title, reference, content
+                FROM sources
+                WHERE tags[1] = %s AND {_JILD_NUM} = %s AND {_PAGE_NUM} = %s
+                ORDER BY created_at, id;
+                """,
+                (slug, jild, page),
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+            # Neighbours come from the data, not page±1: ingestion skips blank and
+            # unreadable pages, so the printed numbering has gaps.
+            cur.execute(
+                f"""
+                SELECT max(p) FILTER (WHERE p < %s) AS prev,
+                       min(p) FILTER (WHERE p > %s) AS next
+                FROM (
+                    SELECT DISTINCT {_PAGE_NUM} AS p
+                    FROM sources
+                    WHERE tags[1] = %s AND {_JILD_NUM} = %s
+                ) q;
+                """,
+                (page, page, slug, jild),
+            )
+            nav = dict(cur.fetchone() or {})
+            return rows, nav
+
+    try:
+        rows, nav = await run_in_threadpool(_query)
+    except Exception as exc:
+        print(f"library_page failed: {exc}")
+        raise HTTPException(status_code=503, detail="Library unavailable")
+    if not rows:
+        raise HTTPException(status_code=404, detail="Page not found")
+
+    name = (rows[0]["reference"] or slug).split(",")[0]
     return {
         "slug": slug,
         "name": name,
-        "total": total,
+        "jild": jild,
         "page": page,
-        "per_page": per_page,
-        "pages": (total + per_page - 1) // per_page,
+        "heading": rows[0]["title"],
         "passages": rows,
+        "prev": nav.get("prev"),
+        "next": nav.get("next"),
     }
 
 
