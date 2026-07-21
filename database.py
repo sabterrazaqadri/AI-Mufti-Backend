@@ -1,5 +1,7 @@
 import os
+import re
 import time
+import uuid
 from contextlib import contextmanager
 from typing import List, Optional, Dict, Any
 
@@ -91,6 +93,24 @@ def init_db():
         # Citations shown alongside an assistant reply. Added after the table
         # existed, so it is an idempotent ALTER rather than part of the CREATE.
         cur.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS sources JSONB;")
+        # Answers a user chose to publish. Kept separate from `messages` on
+        # purpose: publishing is a deliberate act with its own lifetime, and a
+        # published page must survive the chat (and account) it came from.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS public_answers (
+                id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+                slug VARCHAR(220) UNIQUE NOT NULL,
+                question TEXT NOT NULL,
+                answer TEXT NOT NULL,
+                sources JSONB NOT NULL,
+                views INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+            );
+        """)
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_public_answers_created "
+            "ON public_answers(created_at DESC);"
+        )
         cur.execute("CREATE INDEX IF NOT EXISTS idx_chats_user_id ON chats(user_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_chats_updated_at ON chats(updated_at DESC);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_chat_id ON messages(chat_id);")
@@ -227,3 +247,89 @@ class MessageRepository:
                 (chat_id,),
             )
             return [dict(row) for row in cur.fetchall()]
+
+
+# ---------------------------------------------------------------------------
+# Published answers
+# ---------------------------------------------------------------------------
+# A user can publish an exchange to a public, indexable page. Only answers that
+# actually carry citations are ever publishable — an unsourced answer must not
+# become a permanent page with our name on it.
+
+# Arabic-script punctuation sits inside the U+0600–U+06FF block, so it survives a
+# naive "keep Arabic letters" filter and ends up in the URL. Strip it explicitly.
+_SLUG_PUNCT = re.compile(r"[،؛؟۔٪-٭۝]")
+_SLUG_STRIP = re.compile(r"[^\w؀-ۿ\s-]", re.UNICODE)
+_SLUG_SPACE = re.compile(r"[\s_]+")
+
+
+def slugify_question(text: str, max_len: int = 70) -> str:
+    """URL slug from the question itself.
+
+    Urdu and Arabic letters are KEPT rather than stripped: percent-encoded
+    Unicode URLs are handled correctly by search engines and are far more
+    meaningful to this audience than a transliteration would be.
+    """
+    s = _SLUG_PUNCT.sub(" ", (text or "").strip().lower())
+    s = _SLUG_STRIP.sub("", s)
+    s = _SLUG_SPACE.sub("-", s).strip("-")
+    if len(s) > max_len:
+        s = s[:max_len].rsplit("-", 1)[0] or s[:max_len]
+    return s or "masla"
+
+
+class PublicAnswerRepository:
+    @staticmethod
+    def publish(question: str, answer: str, sources: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Insert, resolving slug collisions with a short suffix."""
+        base = slugify_question(question)
+        with get_cursor(commit=True) as cur:
+            for attempt in range(6):
+                slug = base if attempt == 0 else f"{base}-{uuid.uuid4().hex[:5]}"
+                try:
+                    cur.execute(
+                        """
+                        INSERT INTO public_answers (slug, question, answer, sources)
+                        VALUES (%s, %s, %s, %s)
+                        RETURNING slug, question, answer, sources, created_at;
+                        """,
+                        (slug, question, answer, Json(sources)),
+                    )
+                    return dict(cur.fetchone())
+                except psycopg2.errors.UniqueViolation:
+                    cur.connection.rollback()
+            raise RuntimeError("Could not allocate a unique slug")
+
+    @staticmethod
+    def get(slug: str) -> Optional[Dict[str, Any]]:
+        with get_cursor(commit=True) as cur:
+            cur.execute(
+                """
+                UPDATE public_answers SET views = views + 1
+                WHERE slug = %s
+                RETURNING slug, question, answer, sources, views, created_at;
+                """,
+                (slug,),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    @staticmethod
+    def list(limit: int = 50, offset: int = 0) -> List[Dict[str, Any]]:
+        with get_cursor() as cur:
+            cur.execute(
+                """
+                SELECT slug, question, created_at
+                FROM public_answers
+                ORDER BY created_at DESC
+                LIMIT %s OFFSET %s;
+                """,
+                (limit, offset),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    @staticmethod
+    def count() -> int:
+        with get_cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS n FROM public_answers;")
+            return int(cur.fetchone()["n"])

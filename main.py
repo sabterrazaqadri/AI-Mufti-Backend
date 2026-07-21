@@ -3,7 +3,7 @@ import json
 import os
 import threading
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 import google.generativeai as genai
@@ -19,6 +19,7 @@ from slowapi.util import get_remote_address
 
 import database as db
 import rag
+import whatsapp
 from auth import auth_configured, get_current_user_id, get_optional_user_id
 
 # ================= CONFIGURATION =================
@@ -252,6 +253,10 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type"],
     expose_headers=["X-Chat-Id", "X-Sources"],
 )
+
+
+# WhatsApp routes are always mounted but inert until the Meta credentials exist.
+app.include_router(whatsapp.router)
 
 
 def _encode_sources(passages) -> str:
@@ -678,6 +683,205 @@ async def library_page(slug: str, jild: int, page: int):
         "prev": nav.get("prev"),
         "next": nav.get("next"),
     }
+
+
+@app.get("/api/library/search")
+@limiter.limit("30/minute")
+async def library_search(request: Request, q: str, limit: int = 20):
+    """Semantic search straight over the corpus — no chat, no model answer.
+
+    Deliberately more permissive than the chat threshold: here the reader judges
+    relevance themselves, so a weaker match is useful rather than dangerous. The
+    chat path must stay strict, because there the model would *rule* from it."""
+    query = (q or "").strip()
+    if len(query) < 2:
+        raise HTTPException(status_code=400, detail="Query too short")
+    limit = min(max(1, limit), 50)
+
+    try:
+        passages = await run_in_threadpool(
+            rag.retrieve, query, limit, float(os.getenv("RAG_SEARCH_MIN_SCORE", "0.55"))
+        )
+    except Exception as exc:
+        print(f"library_search failed: {exc}")
+        raise HTTPException(status_code=503, detail="Search unavailable")
+
+    return {"query": query, "count": len(passages), "results": rag.public_passages(passages)}
+
+
+# ================= QUR'AN (public) =================
+# The Qur'an was ingested page by page from the mushaf, with canonical text and
+# ayah numbers inline: "(217) يَسْـَٔلُونَكَ ...". It is served the same way — as
+# mushaf pages — rather than reconstructed surah by surah.
+#
+# That is a deliberate limit, not laziness: only 104 of the 114 surah names ever
+# appear as a page title, and a page can span two surahs where the numbering
+# restarts. Rebuilding surahs from that would risk attributing an ayah to the
+# wrong surah, which is not an acceptable failure mode for the Qur'an.
+
+QURAN_SLUG = "al-quran-ul-kareem"
+
+_AYAH_RE = __import__("re").compile(r"\((\d{1,3})\)\s*")
+_PREFIX_RE = __import__("re").compile(r"^\[[^\]]*\]\s*")
+
+
+def _parse_ayat(content: str):
+    """Split a page's text on its inline ayah markers. Text before the first
+    marker (a surah header or basmala) is returned separately, never dropped."""
+    body = _PREFIX_RE.sub("", content or "").strip()
+    parts = _AYAH_RE.split(body)
+    lead = parts[0].strip()
+    ayat = []
+    for i in range(1, len(parts) - 1, 2):
+        text = parts[i + 1].strip()
+        if text:
+            ayat.append({"number": int(parts[i]), "text": text})
+    return lead, ayat
+
+
+@app.get("/api/quran/pages")
+async def quran_pages():
+    """Every mushaf page with the surah(s) printed on it."""
+    def _query():
+        with db.get_cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT {_PAGE_NUM} AS page,
+                       (array_agg(title ORDER BY created_at, id))[1] AS surah
+                FROM sources
+                WHERE tags[1] = %s AND array_length(tags, 1) >= 3
+                GROUP BY 1 ORDER BY 1;
+                """,
+                (QURAN_SLUG,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    try:
+        pages = await run_in_threadpool(_query)
+    except Exception as exc:
+        print(f"quran_pages failed: {exc}")
+        raise HTTPException(status_code=503, detail="Unavailable")
+    if not pages:
+        raise HTTPException(status_code=404, detail="Qur'an not ingested")
+
+    # Surah index: the first page each name appears on. Names come from the page
+    # titles, so a surah that never titles a page simply is not listed — better
+    # than guessing where it starts.
+    seen, index = set(), []
+    for p in pages:
+        for part in (p["surah"] or "").split("—"):
+            name = part.strip()
+            if name and name not in seen:
+                seen.add(name)
+                index.append({"surah": name, "page": p["page"]})
+
+    return {"pages": pages, "total": len(pages), "surahs": index}
+
+
+@app.get("/api/quran/pages/{page}")
+async def quran_page(page: int):
+    """One mushaf page: its ayat, in order, with neighbours."""
+    def _query():
+        with db.get_cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT title, reference, content
+                FROM sources
+                WHERE tags[1] = %s AND {_PAGE_NUM} = %s
+                ORDER BY created_at, id;
+                """,
+                (QURAN_SLUG, page),
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+            cur.execute(
+                f"""
+                SELECT max(p) FILTER (WHERE p < %s) AS prev,
+                       min(p) FILTER (WHERE p > %s) AS next
+                FROM (SELECT DISTINCT {_PAGE_NUM} AS p FROM sources WHERE tags[1] = %s) q;
+                """,
+                (page, page, QURAN_SLUG),
+            )
+            return rows, dict(cur.fetchone() or {})
+
+    try:
+        rows, nav = await run_in_threadpool(_query)
+    except Exception as exc:
+        print(f"quran_page failed: {exc}")
+        raise HTTPException(status_code=503, detail="Unavailable")
+    if not rows:
+        raise HTTPException(status_code=404, detail="Page not found")
+
+    lead, ayat = "", []
+    for r in rows:
+        l, a = _parse_ayat(r["content"])
+        if l and not lead:
+            lead = l
+        ayat.extend(a)
+
+    return {
+        "page": page,
+        "surah": rows[0]["title"],
+        "reference": rows[0]["reference"],
+        "lead": lead,
+        "ayat": ayat,
+        "prev": nav.get("prev"),
+        "next": nav.get("next"),
+    }
+
+
+# ================= PUBLISHED ANSWERS (public) =================
+
+class PublishRequest(BaseModel):
+    question: str = Field(..., min_length=3, max_length=4000)
+    answer: str = Field(..., min_length=20)
+    sources: List[Dict[str, Any]] = Field(..., min_length=1)
+
+
+@app.post("/api/answers")
+@limiter.limit("6/minute")
+async def publish_answer(request: Request, body: PublishRequest):
+    """Publish an exchange to a permanent, indexable page.
+
+    Guarded on citations: an answer with no sources is either a refusal or
+    ungrounded, and neither should become a permanent page carrying our name."""
+    if not body.sources:
+        raise HTTPException(status_code=400, detail="Only sourced answers can be published")
+    # The refusal wording must never be published, even if citations rode along.
+    if "مستند حوالہ نہیں" in body.answer or "mustanad hawala nahi" in body.answer.lower():
+        raise HTTPException(status_code=400, detail="Refusals cannot be published")
+
+    try:
+        row = await run_in_threadpool(
+            db.PublicAnswerRepository.publish, body.question, body.answer, body.sources
+        )
+    except Exception as exc:
+        print(f"publish_answer failed: {exc}")
+        raise HTTPException(status_code=503, detail="Could not publish right now")
+    return {"slug": row["slug"], "url": f"/masla/{row['slug']}"}
+
+
+@app.get("/api/answers")
+async def list_answers(limit: int = 50, offset: int = 0):
+    limit = min(max(1, limit), 100)
+    try:
+        rows = await run_in_threadpool(db.PublicAnswerRepository.list, limit, max(0, offset))
+        total = await run_in_threadpool(db.PublicAnswerRepository.count)
+    except Exception as exc:
+        print(f"list_answers failed: {exc}")
+        raise HTTPException(status_code=503, detail="Unavailable")
+    return {"answers": rows, "total": total}
+
+
+@app.get("/api/answers/{slug}")
+async def get_answer(slug: str):
+    try:
+        row = await run_in_threadpool(db.PublicAnswerRepository.get, slug)
+    except Exception as exc:
+        print(f"get_answer failed: {exc}")
+        raise HTTPException(status_code=503, detail="Unavailable")
+    if not row:
+        raise HTTPException(status_code=404, detail="Not found")
+    return row
 
 
 # ================= CHAT HISTORY (auth required) =================
