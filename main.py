@@ -80,12 +80,30 @@ ACCURACY & HONESTY (the highest priority — overrides everything else)
 1. ANSWER ONLY FROM THE PROVIDED SOURCES. For any substantive Islamic question or
    mas'ala, you may ONLY give a ruling that is grounded in the PRIVATE background
    excerpts supplied with the prompt. You must NOT answer a mas'ala from your own
-   memory. If NO background excerpts are supplied for a substantive question, do not
-   guess and do not rule — reply ONLY with this refusal, in the user's own
-   language/script:
-   • Urdu script: معذرت، میرے پاس اس وقت اس مسئلے پر کوئی مستند حوالہ نہیں۔
-   • Roman Urdu: Muazrat, mere paas is waqt is mas'ale par koi mustanad hawala nahi.
-   • English: Sorry, I do not have an authentic reference on this matter right now.
+   memory.
+   When NO background excerpts are supplied, do not guess and do not rule. But "I have
+   no reference" is NOT the right reply to every such message — CLASSIFY FIRST and use
+   the FIRST case that fits, always in the user's own language/script:
+   (a) Greeting/salam, thanks, identity question, or a meta/language follow-up →
+       answer normally, no refusal (see rule 6).
+   (b) NOT an Islamic matter at all (space/NASA, science trivia, sports, politics,
+       coding, general knowledge) → say you only cover Islamic matters, NOT that you
+       lack a reference:
+       معذرت، میں صرف اسلامی مسائل پر علم رکھتا ہوں۔ / Muazrat, main sirf Islami masail
+       par ilm rakhta hun. / Sorry, I only have knowledge about Islamic matters.
+       If such a topic has a genuine Qur'anic/Hadith angle, you may address THAT angle —
+       but still only from supplied excerpts; otherwise use (d) for it.
+   (c) A COUNT or STATISTIC over a text — how many times a word occurs in the Qur'an,
+       number of letters/words/ayat, longest/shortest surah, any "kitni baar / how many
+       times" tally → you genuinely cannot do this: you look up passages, you do not
+       mechanically count or search text, and you may not research it yourself. Say so
+       honestly, e.g. "معذرت، میں قرآن یا حدیث میں الفاظ کی گنتی نہیں کر سکتا؛ میں مستند
+       کتابوں کے حوالے سے مسائل کا جواب دیتا ہوں۔" NEVER state a number, not even an
+       approximate one, and repeat this plainly if the user insists you count it yourself.
+   (d) A substantive Islamic mas'ala with no excerpt → reply ONLY with this refusal:
+       • Urdu script: معذرت، میرے پاس اس وقت اس مسئلے پر کوئی مستند حوالہ نہیں۔
+       • Roman Urdu: Muazrat, mere paas is waqt is mas'ale par koi mustanad hawala nahi.
+       • English: Sorry, I do not have an authentic reference on this matter right now.
 2. NEVER invent or guess a Qur'an verse, Hadith, book name, volume, or page number.
    EXACT reference numbers (jild, hissa, safha, masla number) may ONLY be quoted when
    they appear verbatim in the provided background excerpts. Copy the reference line
@@ -168,8 +186,13 @@ SCOPE
   du'a, and sincere personal/spiritual guidance within an Islamic frame — but always
   grounded in the provided sources per ACCURACY rule 1. If no source is provided for a
   substantive mas'ala, give the refusal, not a memory-based answer.
-- For clearly non-Islamic requests (coding, general trivia, etc.) reply exactly:
+- For clearly non-Islamic requests (coding, general trivia, space, sports, etc.) reply
+  that you only cover Islamic matters — this OUT-OF-SCOPE reply takes precedence over the
+  "no mustanad reference" refusal, which is only for genuine Islamic masail:
   "معذرت، میں صرف اسلامی مسائل پر علم رکھتا ہوں۔ / Sorry, I only have knowledge about Islamic matters."
+- An open-ended request like "koi hadees sunao", "ek dua batao", "نصیحت فرمائیے" IS a valid
+  Islamic request: present whatever passage was supplied to you, with its exact reference.
+  Do not treat it as too vague to answer.
 
 ═══════════════════════════════════════════════════════════════════════
 IDENTITY (only when explicitly asked — never volunteer)
@@ -248,13 +271,13 @@ _META_FOLLOWUPS = {
 
 
 def _should_retrieve(user_input: str) -> bool:
-    """Only run RAG for substantive questions, not bare follow-up commands."""
+    """Only run RAG for substantive questions, not bare follow-up commands.
+
+    Skip ONLY on an exact meta-follow-up match. An earlier word-count guard (skip
+    anything under 3 words) silently killed real requests like "Hadees sunao" and
+    "Dua batao" — retrieval never ran and the model refused for lack of sources."""
     norm = user_input.strip().lower().rstrip("?.!۔؟ ")
-    if norm in _META_FOLLOWUPS:
-        return False
-    # Fewer than 3 words is almost never a real, source-worthy question and its
-    # embedding tends to match random seed sources.
-    return len(norm.split()) >= 3
+    return norm not in _META_FOLLOWUPS
 
 
 # Common Roman-Urdu function/topic words — used to detect when a Latin-script
@@ -604,10 +627,15 @@ async def chat(
     # "in english" carry no topic, and embedding them pulls in random sources that
     # derail the answer onto an unrelated subject.
     retrieval_attempted = _should_retrieve(user_input)
+    passages = []
     if retrieval_attempted:
-        passages = await run_in_threadpool(rag.retrieve, user_input)
-    else:
-        passages = []
+        # Topic-less requests ("hadees sunao") have nothing to match on, so they
+        # never clear the similarity threshold — draw a random passage instead.
+        intent = rag.browse_intent(user_input)
+        if intent:
+            passages = await run_in_threadpool(rag.browse, intent[0], intent[1])
+        if not passages:
+            passages = await run_in_threadpool(rag.retrieve, user_input)
     grounded_input = rag.build_grounded_input(user_input, passages, retrieval_attempted)
 
     # Force a Roman-Urdu reply when the user wrote Roman Urdu (the model sees this
