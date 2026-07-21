@@ -1,10 +1,11 @@
 import os
+import time
 from contextlib import contextmanager
 from typing import List, Optional, Dict, Any
 
 import psycopg2
 from psycopg2.pool import ThreadedConnectionPool
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import RealDictCursor, Json
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -22,12 +23,23 @@ def _get_pool() -> ThreadedConnectionPool:
     if _pool is None:
         if not DATABASE_URL:
             raise ValueError("DATABASE_URL not set in environment variables")
-        _pool = ThreadedConnectionPool(
-            minconn=1,
-            maxconn=int(os.getenv("DB_POOL_MAX", "10")),
-            dsn=DATABASE_URL,
-            cursor_factory=RealDictCursor,
-        )
+        # Neon's pooler endpoint occasionally drops/resets the connection or
+        # has a transient DNS blip; retry a few times before giving up.
+        last_exc = None
+        for attempt in range(5):
+            try:
+                _pool = ThreadedConnectionPool(
+                    minconn=1,
+                    maxconn=int(os.getenv("DB_POOL_MAX", "10")),
+                    dsn=DATABASE_URL,
+                    cursor_factory=RealDictCursor,
+                )
+                break
+            except psycopg2.OperationalError as exc:
+                last_exc = exc
+                time.sleep(20)
+        else:
+            raise last_exc
     return _pool
 
 
@@ -76,6 +88,9 @@ def init_db():
                 created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
             );
         """)
+        # Citations shown alongside an assistant reply. Added after the table
+        # existed, so it is an idempotent ALTER rather than part of the CREATE.
+        cur.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS sources JSONB;")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_chats_user_id ON chats(user_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_chats_updated_at ON chats(updated_at DESC);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_chat_id ON messages(chat_id);")
@@ -171,18 +186,27 @@ class MessageRepository:
         return cur.fetchone() is not None
 
     @staticmethod
-    def create_message(chat_id: str, user_id: str, role: str, content: str) -> Optional[Dict[str, Any]]:
-        """Insert a message only if the user owns the chat."""
+    def create_message(
+        chat_id: str,
+        user_id: str,
+        role: str,
+        content: str,
+        sources: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Insert a message only if the user owns the chat.
+
+        `sources` are the citations shown with an assistant reply; storing them
+        is what lets a reopened chat still show where its rulings came from."""
         with get_cursor(commit=True) as cur:
             if not MessageRepository._user_owns_chat(cur, chat_id, user_id):
                 return None
             cur.execute(
                 """
-                INSERT INTO messages (chat_id, role, content)
-                VALUES (%s, %s, %s)
-                RETURNING id, chat_id, role, content, created_at;
+                INSERT INTO messages (chat_id, role, content, sources)
+                VALUES (%s, %s, %s, %s)
+                RETURNING id, chat_id, role, content, sources, created_at;
                 """,
-                (chat_id, role, content),
+                (chat_id, role, content, Json(sources) if sources else None),
             )
             result = cur.fetchone()
             cur.execute("UPDATE chats SET updated_at = NOW() WHERE id = %s;", (chat_id,))
@@ -195,7 +219,7 @@ class MessageRepository:
                 return []
             cur.execute(
                 """
-                SELECT id, chat_id, role, content, created_at
+                SELECT id, chat_id, role, content, sources, created_at
                 FROM messages
                 WHERE chat_id = %s
                 ORDER BY created_at ASC;

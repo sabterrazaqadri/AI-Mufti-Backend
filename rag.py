@@ -283,7 +283,7 @@ def _search(qvec: List[float], k: int) -> List[Dict[str, Any]]:
         cur.execute("SET LOCAL ivfflat.probes = %s;", (int(os.getenv("RAG_PROBES", "16")),))
         cur.execute(
             """
-            SELECT title, reference, content, lang,
+            SELECT title, reference, content, lang, tags[1] AS slug,
                    1 - (embedding <=> %s::vector) AS score
             FROM sources
             ORDER BY embedding <=> %s::vector
@@ -398,7 +398,7 @@ def browse(tags, needle: Optional[str], k: int = 3) -> List[Dict[str, Any]]:
     try:
         with db.get_cursor() as cur:
             cur.execute(
-                f"SELECT title, reference, content, lang, 1.0 AS score "
+                f"SELECT title, reference, content, lang, tags[1] AS slug, 1.0 AS score "
                 f"FROM sources{clause} ORDER BY random() LIMIT %s;",
                 params,
             )
@@ -450,6 +450,8 @@ def public_passages(passages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "title": p.get("title"),
                 "reference": p.get("reference"),
                 "content": content,
+                # Book tag, so the UI can link a citation to its /library page.
+                "slug": p.get("slug"),
                 "score": round(float(p.get("score") or 0), 3),
             }
         )

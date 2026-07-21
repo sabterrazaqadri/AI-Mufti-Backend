@@ -597,9 +597,11 @@ def _groq_chunks(grounded_text: str, history):
         yield text, choice.get("finish_reason")
 
 
-def _stream_text(user_text: str, grounded_text: str, history, persist=None):
+def _stream_text(user_text: str, grounded_text: str, history, persist=None, sources=None):
     """Stream chunks. `user_text` is persisted; `grounded_text` (with retrieved
-    citations) is what the model actually sees. `persist` = (chat_id, user_id)."""
+    citations) is what the model actually sees. `persist` = (chat_id, user_id).
+    `sources` are stored with the assistant reply so reopening the chat still
+    shows which books the ruling came from."""
     full = ""
     failed = False
     err_detail = ""
@@ -665,15 +667,17 @@ def _stream_text(user_text: str, grounded_text: str, history, persist=None):
     if persist and full:
         try:
             chat_id, user_id = persist
-            db.MessageRepository.create_message(chat_id, user_id, "assistant", full)
+            db.MessageRepository.create_message(
+                chat_id, user_id, "assistant", full, sources=sources
+            )
         except Exception as exc:
             print(f"Persist assistant message failed: {exc}")
 
 
-def _stream_response(user_text: str, grounded_text: str, history, persist=None):
+def _stream_response(user_text: str, grounded_text: str, history, persist=None, sources=None):
     """Encode each chunk to UTF-8 bytes ourselves so the ASGI layer never re-encodes
     the stream with a platform-default charset (which mangled Urdu/Arabic to '?')."""
-    for piece in _stream_text(user_text, grounded_text, history, persist):
+    for piece in _stream_text(user_text, grounded_text, history, persist, sources):
         yield piece.encode("utf-8")
 
 
@@ -751,7 +755,13 @@ async def chat(
     if passages:
         headers["X-Sources"] = _encode_sources(passages)
     return StreamingResponse(
-        _stream_response(user_input, grounded_input, history, persist=(chat_id, user_id)),
+        _stream_response(
+            user_input,
+            grounded_input,
+            history,
+            persist=(chat_id, user_id),
+            sources=rag.public_passages(passages) if passages else None,
+        ),
         media_type="text/plain; charset=utf-8",
         headers=headers,
     )
