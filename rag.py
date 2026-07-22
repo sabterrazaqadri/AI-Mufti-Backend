@@ -103,7 +103,11 @@ _NO_SOURCE_DIRECTIVE = (
     "    • English: Sorry, I do not have an authentic reference on this matter right now.\n"
     "\n"
     "In every case: do NOT mention sources, a library, retrieval, or that anything was or "
-    "wasn't found — say nothing beyond the reply itself.\n\n"
+    "wasn't found — say nothing beyond the reply itself.\n"
+    "The three wordings above are examples, not the whole list. If the user wrote in ANY "
+    "other language (Hindi, Bengali, Turkish, Arabic, Persian, Indonesian, French, "
+    "Pashto, …), give that same sentence in THAT language and script — never fall back to "
+    "English just because the user's language is not listed here.\n\n"
     "---\nUser's message:\n"
 )
 
@@ -237,16 +241,29 @@ _REWRITE_PROMPT = (
 # produced a confidently wrong grounding). Discard rewrites that drift this far from
 # the original in embedding space.
 REWRITE_MIN_SIM = float(os.getenv("RAG_REWRITE_MIN_SIM", "0.75"))
-_LATIN_RE = None  # lazy-compiled
+
+# Arabic script, incl. the Urdu/Persian extensions and presentation forms.
+_ARABIC_SCRIPT_RE = re.compile(r"[؀-ۿݐ-ݿﭐ-﷿ﹰ-﻿]")
+_LETTER_RE = re.compile(r"[^\W\d_]", re.UNICODE)
+
+
+def _is_arabic_script(text: str) -> bool:
+    """True when the query is already written in the corpus's own script."""
+    letters = _LETTER_RE.findall(text)
+    if not letters:
+        return False
+    arabic = sum(1 for c in letters if _ARABIC_SCRIPT_RE.match(c))
+    return arabic / len(letters) >= 0.5
 
 
 def _rewrite_query_to_urdu(query: str) -> Optional[str]:
-    global _LATIN_RE
-    import re
-    if _LATIN_RE is None:
-        _LATIN_RE = re.compile(r"[A-Za-z]{3,}")
-    if not _LATIN_RE.search(query):
-        return None  # already Urdu/Arabic script
+    # Rewrite ANY non-Arabic-script query, not just Latin ones. The embeddings are
+    # multilingual, so Hindi/Bengali/Turkish do retrieve unaided — but measured on
+    # this corpus they land around 0.67–0.74, straddling the 0.70 threshold, and
+    # the Urdu rewrite is what reliably pushes a real question over it. The old
+    # [A-Za-z] trigger silently skipped every non-Latin script.
+    if _is_arabic_script(query):
+        return None
     try:
         model = genai.GenerativeModel(
             REWRITE_MODEL,
