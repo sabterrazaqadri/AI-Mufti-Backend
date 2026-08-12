@@ -513,6 +513,7 @@ BOOK_CATEGORIES = {
     "tasbeehat-e-ramazan": "fiqh-o-fatawa",
     "tareef-per-inam": "fiqh-o-fatawa",
     "zia-ul-harmain": "fiqh-o-fatawa",
+    "ahkam-e-shariat": "fiqh-o-fatawa",
 
     "ja-al-haq": "aqaid",
     "al-haqq-ul-mubeen": "aqaid",
