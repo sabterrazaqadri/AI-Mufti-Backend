@@ -1324,6 +1324,10 @@ def _strip_unasked_salam(user_text: str, chunks):
         yield _REPLY_SALAM_RE.sub("", buf, count=1), None
 
 
+# Separates the answer text from the trailing base64(JSON) list of cited sources.
+SOURCES_TRAILER = "\x1e"
+
+
 def _stream_text(user_text: str, grounded_text: str, history, persist=None, sources=None):
     """Stream chunks. `user_text` is persisted; `grounded_text` (with retrieved
     citations) is what the model actually sees. `persist` = (chat_id, user_id).
@@ -1390,15 +1394,22 @@ def _stream_text(user_text: str, grounded_text: str, history, persist=None, sour
         full += note
         yield note
 
+    # Only the passages the answer actually cites are its sources — not every
+    # retrieved one. A refusal / out-of-scope reply carries no ruling, so it gets
+    # none. The final list rides at the very end of the stream, after a record
+    # separator, so the client can replace the provisional X-Sources header.
+    cited = None
+    if sources:
+        cited = [] if _is_refusal_answer(full) else rag.cited_passages(full, sources)
+        yield SOURCES_TRAILER + base64.b64encode(
+            json.dumps(cited, ensure_ascii=False).encode("utf-8")
+        ).decode("ascii")
+
     # Persist the assistant reply separately so a DB hiccup can't corrupt the output.
     if persist and full:
         try:
             chat_id, user_id = persist
-            # A refusal / out-of-scope reply carries no ruling, so it must not be
-            # stored with citations — otherwise reopening the chat shows sources under
-            # a "koi mustanad hawala nahi" answer (the live panel is cleared the same
-            # way on the client).
-            persist_sources = None if _is_refusal_answer(full) else sources
+            persist_sources = cited or None
             db.MessageRepository.create_message(
                 chat_id, user_id, "assistant", full, sources=persist_sources
             )
@@ -1467,7 +1478,12 @@ async def chat(
         if passages:
             headers["X-Sources"] = _encode_sources(passages)
         return StreamingResponse(
-            _stream_response(user_input, grounded_input, history=[]),
+            _stream_response(
+                user_input,
+                grounded_input,
+                history=[],
+                sources=rag.public_passages(passages) if passages else None,
+            ),
             media_type="text/plain; charset=utf-8",
             headers=headers,
         )

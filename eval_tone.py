@@ -69,7 +69,11 @@ def ask(text: str):
     with urllib.request.urlopen(req, timeout=180) as resp:
         raw_sources = resp.headers.get("X-Sources")
         body = resp.read().decode("utf-8", errors="replace")
-    sources = json.loads(base64.b64decode(raw_sources)) if raw_sources else []
+    # The stream ends with "\x1e" + base64(JSON) of the sources actually cited;
+    # the header (every retrieved passage) is only the fallback.
+    body, _, trailer = body.partition("\x1e")
+    raw = trailer or raw_sources
+    sources = json.loads(base64.b64decode(raw)) if raw else []
     return body.strip(), sources
 
 

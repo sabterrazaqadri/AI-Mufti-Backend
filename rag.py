@@ -679,6 +679,63 @@ def _digits(tag: Optional[str]) -> Optional[int]:
     return int(d) if d else None
 
 
+def _book_pattern(book: str) -> Optional["re.Pattern[str]"]:
+    """Spelling-tolerant regex for a book name, matched against an answer reduced
+    to its Latin letters. Vowels are optional, w/v interchange and doubled letters
+    collapse, so 'Fatawa-Razawiyya' also matches 'Fatawa Razvia'."""
+    letters = re.sub(r"[^a-z]", "", (book or "").lower())
+    skeleton = re.sub(r"(.)\1+", r"\1", re.sub(r"[aeiouy]+", "", letters))
+    if len(skeleton) < 4:
+        return None
+    parts = ["[wv]" if c in "wv" else re.escape(c) for c in skeleton]
+    return re.compile("[aeiouy]*" + "+[aeiouy]*".join(parts) + "+")
+
+
+_NUM_RE = re.compile(r"\d+")
+
+
+def cited_passages(answer: str, passages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Keep only the passages the answer actually cites.
+
+    Retrieval always hands the model TOP_K passages, but an answer usually cites
+    one or two of them — showing all as "sources" made every reply look like it
+    had exactly six. A passage counts as cited when its book is named in the
+    answer and the text right after that mention carries its jild and at least
+    one of its page/masla numbers (where the reference has them); a book named
+    with numbers we cannot match still contributes its best passage.
+
+    An answer that cites nothing gets no sources: listing passages it never used
+    would claim a grounding the answer does not have."""
+    if not passages or not answer:
+        return []
+    low = answer.lower()
+    keep = [i for i, ch in enumerate(low) if "a" <= ch <= "z"]
+    letters = "".join(low[i] for i in keep)
+
+    chosen, named_books, exact_books = [], {}, set()
+    for p in passages:
+        ref = p.get("reference") or ""
+        book = ref.split(",")[0].strip()
+        pat = _book_pattern(book)
+        if pat is None:
+            continue
+        nums = _NUM_RE.findall(ref)
+        has_jild = bool(re.search(r"jild\s*\d", ref, re.I))
+        jild, rest = (nums[0], set(nums[1:])) if has_jild and nums else (None, set(nums))
+        for m in pat.finditer(letters):
+            named_books.setdefault(book, p)  # passages arrive best-score first
+            pos = keep[m.end() - 1] + 1  # just past the book name in the real answer
+            wnums = set(_NUM_RE.findall(low[pos:pos + 120]))
+            if (jild is None or jild in wnums) and (not rest or wnums & rest):
+                chosen.append(p)
+                exact_books.add(book)
+                break
+    # A book named without numbers we can match (e.g. "Bahar-e-Shariat, Hissa 3"
+    # where the index says Jild) still counts — show its best passage.
+    chosen += [p for b, p in named_books.items() if b not in exact_books]
+    return chosen
+
+
 def public_passages(passages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Trimmed, JSON-safe shape for the frontend Sources panel."""
     out = []
